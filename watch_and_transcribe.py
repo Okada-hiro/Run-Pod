@@ -15,11 +15,16 @@ while True:
             audio_path = os.path.join(WATCH_DIR, f)
             print(f"[INFO] 新しい音声を検知: {audio_path}")
 
-            # 文字起こし
-            output_txt = os.path.join(WATCH_DIR, f + ".txt")
-            text = whisper_text_only(audio_path, model="medium", language="ja", output_txt=output_txt)
-            print(f"[INFO] 文字起こし完了: {output_txt}")
-
+            # --- 1. 文字起こし ---
+            output_txt_path = os.path.join(WATCH_DIR, f + ".txt")
+            print(f"[INFO] 文字起こしを開始... )")
+            question_text = whisper_text_only(
+                audio_path,
+                model="medium",
+                language="ja",
+                output_txt=output_txt_path
+            )
+            print(f"[INFO] 文字起こし完了: {output_txt_path}")
             print(f"[INFO] 質問内容: {question_text}")
 
             # --- 2. 回答生成 (★追加) ---

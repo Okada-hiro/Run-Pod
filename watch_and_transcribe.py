@@ -3,6 +3,7 @@ import time
 import os
 from transcribe_func import whisper_text_only
 from answer_generator import generate_answer
+from text_to_speech import synthesize_speech
 
 WATCH_DIR = "incoming_audio"
 

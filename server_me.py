@@ -1,4 +1,4 @@
-from flask import Flask, request
+from flask import Flask, request, send_from_directory
 import os
 import uuid
 
@@ -37,6 +37,17 @@ def upload_file():
     except Exception as e:
         print(f"File save error: {e}")
         return f"Error saving file: {e}", 500
+    
+@app.route('/download/<path:filename>', methods=['GET'])
+def download_file(filename):
+    # URL エンコードされている場合にデコード
+    filename = unquote(filename)
+    file_path = os.path.join(SAVE_DIR, filename)
+
+    if not os.path.exists(file_path):
+        return f"File {filename} not found", 404
+
+    return send_from_directory(SAVE_DIR, filename, as_attachment=True)
 
 if __name__ == "__main__":
     # ポート5000で起動

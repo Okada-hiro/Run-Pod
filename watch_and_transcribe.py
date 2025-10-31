@@ -41,6 +41,21 @@ while True:
             except Exception as e:
                 print(f"[ERROR] 回答ファイルの保存に失敗しました: {e}")
 
+            # --- 4. 回答の音声合成 (★追加) ---
+            print(f"[INFO] 回答の音声合成を開始...")
+            # 出力パスは絶対パスで渡す
+            answer_wav_path_abs = os.path.abspath(os.path.join(WATCH_DIR, f + ".ans.wav"))
+            
+            success_tts = synthesize_speech(
+                text_to_speak=answer_text,
+                output_wav_path=answer_wav_path_abs
+            )
+            
+            if success_tts:
+                print(f"[INFO] 音声合成 完了: {answer_wav_path_abs}")
+            else:
+                print(f"[WARN] 音声合成に失敗しました。")
+
             already_seen.add(f)
 
     time.sleep(1)  # 1秒ごとにチェック

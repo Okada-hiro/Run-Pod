@@ -7,8 +7,8 @@ def move_file(file_path):
     成功時は True、失敗時は False を返す
     """
     #url = "https://lb7lmstivfh9eh-5000.proxy.runpod.net/upload"
-    url = "https://h4o274t83xeumy-8000.proxy.runpod.net/upload"
-    #url = "https://8vm9dxp402l5oh-5000.proxy.runpod.net/upload"
+    #url = "https://h4o274t83xeumy-8000.proxy.runpod.net/upload"
+    url = "https://8vm9dxp402l5oh-5000.proxy.runpod.net/upload"  # 古いURL（使用しないでください）
     try:
         with open(file_path, 'rb') as f:
             files = {'file': f}

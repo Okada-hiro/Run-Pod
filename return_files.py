@@ -1,4 +1,5 @@
 from urllib.parse import quote
+from urllib.parse import unquote  
 import requests
 
 filename = quote("received_日本語音源-2.wav")  # 日本語は URL エンコード

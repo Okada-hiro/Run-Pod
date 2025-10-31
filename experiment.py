@@ -26,7 +26,19 @@ while True:
             print(f"[INFO] 文字起こし完了: {output_txt_path}")
             print(f"[INFO] 質問内容: {question_text}")
 
-          
+              # --- 2. 回答生成 (★追加) ---
+            print(f"[INFO] 回答生成を開始...")
+            answer_text = generate_answer(question_text)
+            print(f"[INFO] 回答: {answer_text}")
+
+            # --- 3. 回答の保存 (★追加) ---
+            answer_file_path = os.path.join(WATCH_DIR, f + ".ans.txt")
+            try:
+                with open(answer_file_path, "w", encoding="utf-8") as ans_f:
+                    ans_f.write(answer_text)
+                print(f"[INFO] 回答を保存: {answer_file_path}")
+            except Exception as e:
+                print(f"[ERROR] 回答ファイルの保存に失敗しました: {e}")
 
             already_seen.add(f)
 

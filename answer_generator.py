@@ -6,7 +6,12 @@ import time
 # --- OpenAI APIキー設定 ---
 # RunPodの環境変数、またはColabのSecretsからAPIキーを読み込みます。
 
-# openai.api_key =
+# 環境変数 OPENAI_API_KEY から取得
+openai.api_key = os.getenv("OPENAI_API_KEY")
+
+# 確認用（必要なら）
+if openai.api_key is None:
+    raise ValueError("環境変数 OPENAI_API_KEY が設定されていません")
 
 
 def generate_answer(question: str, model="gpt-4o-mini") -> str:

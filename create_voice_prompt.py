@@ -6,7 +6,7 @@ import shutil
 # --- 設定 ---
 FISH_SPEECH_DIR = "fish-speech"
 # 参照音声ファイル (fish-speechディレクトリ内に配置してください)
-REFERENCE_AUDIO_NAME = "日本語音源-2.wav" 
+REFERENCE_AUDIO_NAME = "japanese_sound.wav" 
 # 生成するプロンプトファイル (この名前をtext_to_speech.pyでも使います)
 PROMPT_TOKEN_FILE_NAME = "fake.npy" 
 # ---

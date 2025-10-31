@@ -36,5 +36,5 @@ def move_file(file_path):
 # ... (if __name__ == "__main__": の部分は変更なし) ...
 # 確認用
 if __name__ == "__main__":
-    test_file = "/Users/okadahiroaki/Music/Music/Media.localized/Music/Unknown Artist/Unknown Album/日本語音源-2.wav"  # ここに送信したいファイル名を指定
+    test_file = "/Users/okadahiroaki/Downloads/japanese_sound.wav"  # ここに送信したいファイル名を指定
     move_file(test_file)

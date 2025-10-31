@@ -7,7 +7,8 @@ def move_file(file_path):
     成功時は True、失敗時は False を返す
     """
     #url = "https://lb7lmstivfh9eh-5000.proxy.runpod.net/upload"
-    url = "https://8vm9dxp402l5oh-5000.proxy.runpod.net/upload"
+    url = "https://h4o274t83xeumy-8000.proxy.runpod.net/upload"
+    #url = "https://8vm9dxp402l5oh-5000.proxy.runpod.net/upload"
     try:
         with open(file_path, 'rb') as f:
             files = {'file': f}
@@ -35,5 +36,5 @@ def move_file(file_path):
 # ... (if __name__ == "__main__": の部分は変更なし) ...
 # 確認用
 if __name__ == "__main__":
-    test_file = "/Users/okadahiroaki/Downloads/AI/infodeliver/chatbot/Run_Pod/record.wav"  # ここに送信したいファイル名を指定
+    test_file = "/Users/okadahiroaki/Music/Music/Media.localized/Music/Unknown Artist/Unknown Album/日本語音源-2.wav"  # ここに送信したいファイル名を指定
     move_file(test_file)

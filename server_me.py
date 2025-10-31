@@ -7,6 +7,7 @@ app = Flask(__name__)
 
 # 保存先のディレクトリを incoming_audio に固定
 SAVE_DIR = "incoming_audio"
+
 os.makedirs(SAVE_DIR, exist_ok=True)  # ディレクトリがなければ作成
 
 @app.route('/upload', methods=['POST'])

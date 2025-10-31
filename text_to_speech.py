@@ -9,8 +9,8 @@ FISH_SPEECH_DIR = "/workspace/fish-speech"
 PROMPT_TOKENS = "fake.npy" 
 # text2semantic の中間ファイル (fish-speech/temp/ 以下に作られる)
 INTERMEDIATE_SEMANTIC_FILE = "temp/codes_0.npy"
-# dac のデフォルト出力ファイル (fish-speech/temp/ 以下に作られる)
-DEFAULT_OUTPUT_WAV = "temp/codes_0.wav"
+# dac のデフォルト出力ファイル (fish-speech/ 以下に作られる)
+DEFAULT_OUTPUT_WAV = "fake.wav"
 # ---
 
 def synthesize_speech(text_to_speak: str, output_wav_path: str, prompt_text: str = "はっきりと丁寧な音声で読み上げてください。"):

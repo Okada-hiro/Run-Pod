@@ -1,4 +1,4 @@
-# /workspace/text_to_speech.py (v-FineTuned: Ref_voice)
+# /workspace/text_to_speech.py (v-FineTuned, v2 - パスフラット化)
 import torch
 from pathlib import Path
 from scipy.io.wavfile import write
@@ -6,44 +6,47 @@ import os
 import numpy as np
 import sys
 
-# --- Style-Bert-TTS のインポート ---
-from Style_Bert_VITS2.style_bert_vits2.nlp import bert_models
-from Style_Bert_VITS2.style_bert_vits2.constants import Languages
-from Style_Bert_VITS2.style_bert_vits2.tts_model import TTSModel
+# --- Style-Bert-TTS のインポート (変更なし) ---
+from style_bert_vits2.nlp import bert_models
+from style_bert_vits2.constants import Languages
+from style_bert_vits2.tts_model import TTSModel
 
-# ---
-# グローバル変数の準備
-# ---
+# --- グローバル変数の準備 (変更なし) ---
 GLOBAL_TTS_MODEL = None
-GLOBAL_SPEAKER_ID = None # ★ ファインチューニングモデル用の話者ID
+GLOBAL_SPEAKER_ID = None
 GLOBAL_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# --- ★ 1. ファインチューニングモデルの設定 ---
-FT_MODEL_NAME = "Ref_voice"
+# --- ファインチューニングモデルの設定 ---
+# 話者名 (config.json の spk2id 内) は "Ref_voice" のまま
+FT_SPEAKER_NAME = "Ref_voice" 
+# model_assets/ 直下に置くファイル名
 FT_MODEL_FILE = "Ref_voice_e3_s192.safetensors"
+FT_CONFIG_FILE = "config.json"
+FT_STYLE_FILE = "style_vectors.npy"
 # ---
 
 try:
-    # --- 2. BERTモデルのグローバルロード ---
+    # --- BERTモデルのグローバルロード (変更なし) ---
     print(f"[INFO] Style-Bert-TTS (FT): Loading BERT models...")
     bert_models.load_model(Languages.JP, "ku-nlp/deberta-v2-large-japanese-char-wwm")
     bert_models.load_tokenizer(Languages.JP, "ku-nlp/deberta-v2-large-japanese-char-wwm")
     print("[INFO] Style-Bert-TTS (FT): BERT models loaded.")
 
-    # --- 3. TTSモデルのグローバルロード ---
+    # --- ★ 修正: TTSモデルのロードパス ---
     print("[INFO] Style-Bert-TTS (FT): Loading Fine-Tuned TTSModel...")
     assets_root = Path("model_assets")
     
-    model_path = assets_root / FT_MODEL_NAME / FT_MODEL_FILE
-    config_path = assets_root / FT_MODEL_NAME / "config.json"
-    style_vec_path = assets_root / FT_MODEL_NAME / "style_vectors.npy"
+    # のご要望通り、サブディレクトリ (Ref_voice/) を使わないパスに変更
+    model_path = assets_root / FT_MODEL_FILE
+    config_path = assets_root / FT_CONFIG_FILE
+    style_vec_path = assets_root / FT_STYLE_FILE
 
     if not all([model_path.exists(), config_path.exists(), style_vec_path.exists()]):
-        print(f"[DEBUG] Check Failed (Path: {assets_root / FT_MODEL_NAME}):")
+        print(f"[DEBUG] Check Failed (Path: {assets_root}):")
         print(f"  Model:  {model_path} - Exists: {model_path.exists()}")
         print(f"  Config: {config_path} - Exists: {config_path.exists()}")
         print(f"  Style:  {style_vec_path} - Exists: {style_vec_path.exists()}")
-        raise FileNotFoundError(f"ファインチューニングモデル '{FT_MODEL_NAME}' のファイルが見つかりません。")
+        raise FileNotFoundError(f"モデルファイルが 'model_assets/' 直下に見つかりません。")
 
     GLOBAL_TTS_MODEL = TTSModel(
         model_path=model_path,
@@ -53,14 +56,12 @@ try:
     )
     print("[INFO] Style-Bert-TTS (FT): TTSModel loaded.")
 
-    # --- 4. ★ 話者IDの取得 ---
+    # --- ★ 話者IDの取得 (話者名は 'Ref_voice' で固定) ---
     try:
-        # ご要望 通り、話者名 'Ref_voice' で固定します
-        speaker_name = FT_MODEL_NAME
-        GLOBAL_SPEAKER_ID = GLOBAL_TTS_MODEL.spk2id[speaker_name]
-        print(f"[INFO] Style-Bert-TTS (FT): Found speaker: {speaker_name} (ID: {GLOBAL_SPEAKER_ID})")
+        GLOBAL_SPEAKER_ID = GLOBAL_TTS_MODEL.spk2id[FT_SPEAKER_NAME]
+        print(f"[INFO] Style-Bert-TTS (FT): Found speaker: {FT_SPEAKER_NAME} (ID: {GLOBAL_SPEAKER_ID})")
     except KeyError:
-        print(f"[ERROR] 話者 '{speaker_name}' が config.json (spk2id) に見つかりません。")
+        print(f"[ERROR] 話者 '{FT_SPEAKER_NAME}' が {config_path} (spk2id) に見つかりません。")
         print(f"利用可能な話者: {list(GLOBAL_TTS_MODEL.spk2id.keys())}")
         raise
 
@@ -71,13 +72,8 @@ except Exception as e:
     import traceback
     traceback.print_exc()
 
-# ---
-# watch_and_transcribe.py から呼ばれるメイン関数
-# ---
+# --- synthesize_speech 関数 (変更なし) ---
 def synthesize_speech(text_to_speak: str, output_wav_path: str, prompt_text: str = None):
-    """
-    ファインチューニング済み Style-Bert-TTS でテキストをwavに変換する
-    """
     if GLOBAL_TTS_MODEL is None or GLOBAL_SPEAKER_ID is None:
         print("[ERROR] Style-Bert-TTS (FT) モデルがロードされていません。")
         return False
@@ -85,12 +81,11 @@ def synthesize_speech(text_to_speak: str, output_wav_path: str, prompt_text: str
     try:
         print(f"[DEBUG] Style-Bert-TTS (FT): 音声合成開始... '{text_to_speak[:20]}...'")
         
-        # の推論コード
         sr, audio_data = GLOBAL_TTS_MODEL.infer(
             text=text_to_speak,
             language=Languages.JP,
-            speaker_id=GLOBAL_SPEAKER_ID, # ★ ロード済みのIDを使用
-            style="Neutral",      # スタイルは適宜調整
+            speaker_id=GLOBAL_SPEAKER_ID, # グローバルな話者IDを使用
+            style="Neutral",
             style_weight=0.7,
             sdp_ratio=0.2,
             noise=0.6,
@@ -98,7 +93,7 @@ def synthesize_speech(text_to_speak: str, output_wav_path: str, prompt_text: str
             length=1.0
         )
         
-        # 16-bit PCM への変換 (以前の修正 と同様)
+        # 16-bit PCM への変換
         if audio_data.dtype != np.int16:
             audio_norm = audio_data / np.abs(audio_data).max()
             audio_int16 = (audio_norm * 32767).astype(np.int16)
@@ -117,14 +112,13 @@ def synthesize_speech(text_to_speak: str, output_wav_path: str, prompt_text: str
         traceback.print_exc()
         return False
 
-# --- ★ 追加: 単体テスト ---
+# --- 単体テスト (変更なし) ---
 if __name__ == "__main__":
-    print("\n--- Style-Bert-TTS (FineTuned) 単体テスト ---")
+    print("\n--- Style-Bert-TTS (FineTuned, FlatPath) 単体テスト ---")
     
     if GLOBAL_TTS_MODEL is None:
         print("[FAIL] モデルのグローバルロードに失敗したため、テストを中止します。")
     else:
-        #
         TEST_TEXT = "こんにちは。これは、ファインチューニングしたモデルによる音声合成のテストです。"
         TEST_OUTPUT = "/workspace/test_finetuned_output.wav"
         

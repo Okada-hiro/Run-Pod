@@ -6,10 +6,42 @@ import os
 import numpy as np
 import sys
 
-# --- Style-Bert-TTS のインポート (変更なし) ---
-from Style_Bert_VITS2.style_bert_vits2.nlp import bert_models
-from Style_Bert_VITS2.style_bert_vits2.constants import Languages
-from Style_Bert_VITS2.style_bert_vits2.tts_model import TTSModel
+# --- ★ここから修正 (ここから) ---
+
+# --- 1. Style-Bert-VITS2 リポジトリのルートを sys.path に追加 ---
+# このファイル (new_text_to_speech.py) があるディレクトリ (= /workspace)
+WORKSPACE_DIR = os.path.dirname(os.path.abspath(__file__))
+# git clone したリポジトリのパス
+REPO_PATH = os.path.join(WORKSPACE_DIR, "Style-Bert-VITS2") 
+
+# sys.path にリポジトリのルートを追加
+if REPO_PATH not in sys.path:
+    sys.path.append(REPO_PATH)
+    print(f"[INFO] Added to sys.path: {REPO_PATH}")
+# ---
+
+# --- 2. Style-Bert-TTS のインポート (パス修正) ---
+try:
+    # 変更前: from Style_Bert_VITS2.style_bert_vits2.nlp import bert_models
+    # 変更後:
+    from style_bert_vits2.nlp import bert_models
+    
+    # 変更前: from Style_Bert_VITS2.style_bert_vits2.constants import Languages
+    # 変更後:
+    from style_bert_vits2.constants import Languages
+    
+    # 変更前: from Style_Bert_VITS2.style_bert_vits2.tts_model import TTSModel
+    # 変更後:
+    from style_bert_vits2.tts_model import TTSModel
+    
+except ImportError as e:
+    print(f"[ERROR] Style-Bert-TTS のインポートに失敗しました。")
+    print(f"       REPO_PATH ({REPO_PATH}) が 'Style-Bert-VITS2' として存在するか確認してください。")
+    print(f"       エラー詳細: {e}")
+    # プログラムを停止させるためにエラーを再送出
+    raise
+
+# --- ★ここまで修正 (ここまで) ---
 
 # --- グローバル変数の準備 (変更なし) ---
 GLOBAL_TTS_MODEL = None

@@ -14,7 +14,7 @@ import sys # ★ 優先度1: ロギング出力先指定のため
 # --- 既存の処理モジュールをインポート ---
 try:
     from transcribe_func import whisper_text_only
-    from answer_generator import generate_answer
+    from new_answer_generator import generate_answer
     from new_text_to_speech import synthesize_speech
 except ImportError:
     print("[ERROR] 必要なモジュール(transcribe_func, answer_generator, new_text_to_speech)が見つかりません。")

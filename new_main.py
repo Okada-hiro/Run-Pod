@@ -315,59 +315,46 @@ async def get_root():
 
             // --- 2. VADとマイクのセットアップ ---
             async function setupVAD() {
-                try {
-                    // ★ VADライブラリのインスタンスを作成
-                    vad = await window.VAD.create({
-                        workletURL: 'https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.1.0/dist/vad.worklet.mjs',
-                        modelURL: 'https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.1.0/dist/silero_vad.onnx',
-                        
-                        // ★ VADイベントハンドラ
-                        onSpeechStart: () => {
-                            isSpeaking = true;
-                            vadStatusDiv.textContent = "発話中...";
-                            console.log("VAD: 発話開始");
-                            
-                            // 無音停止タイマーをクリア
-                            if (silenceTimer) {
-                                clearTimeout(silenceTimer);
-                                silenceTimer = null;
-                            }
-                            
-                            // 録音を開始 (まだ開始していなければ)
-                            if (!isRecording) {
-                                startMediaRecorder();
-                            }
-                        },
-                        onSpeechEnd: () => {
-                            isSpeaking = false;
-                            vadStatusDiv.textContent = "発話終了 (無音タイマー起動)";
-                            console.log("VAD: 発話終了");
-                            
-                            // ★ 発話が終了したら、無音タイマーを開始
-                            if (isRecording) {
-                                startSilenceTimer();
-                            }
-                        }
-                    });
+    try {
+        // 1. ユーザー操作でマイクを取得（ここで許可ダイアログが出る）
+        mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
 
-                    // マイクストリームを取得
-                    mediaStream = await vad.Mic.getMediaStream();
-                    
-                    // MediaRecorder のセットアップ
-                    setupMediaRecorder(mediaStream);
-                    
-                    // VAD監視開始
-                    vad.start();
-                    statusDiv.textContent = 'マイク起動完了。話しかけてください。';
-                    vadStatusDiv.textContent = '待機中...';
-                    startButton.disabled = true;
-                    stopButton.disabled = false;
+        // 2. MediaRecorder のセットアップ
+        setupMediaRecorder(mediaStream);
 
-                } catch (err) {
-                    console.error('VADまたはマイクのセットアップに失敗:', err);
-                    statusDiv.textContent = 'マイクへのアクセスが許可されていません。';
-                }
+        // 3. VADライブラリを初期化（取得したマイクストリームを渡す）
+        vad = await window.VAD.create({
+            workletURL: 'https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.1.0/dist/vad.worklet.mjs',
+            modelURL: 'https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.1.0/dist/silero_vad.onnx',
+            audioStream: mediaStream,
+            onSpeechStart: () => {
+                isSpeaking = true;
+                vadStatusDiv.textContent = "発話中...";
+                if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
+                if (!isRecording) startMediaRecorder();
+            },
+            onSpeechEnd: () => {
+                isSpeaking = false;
+                vadStatusDiv.textContent = "発話終了 (無音タイマー起動)";
+                if (isRecording) startSilenceTimer();
             }
+        });
+
+        // 4. VAD を開始
+        vad.start();
+
+        // 5. ボタン・ステータス更新
+        startButton.disabled = true;
+        stopButton.disabled = false;
+        statusDiv.textContent = 'マイク起動完了。話しかけてください。';
+        vadStatusDiv.textContent = '待機中...';
+
+    } catch (err) {
+        console.error('VADまたはマイクのセットアップに失敗:', err);
+        statusDiv.textContent = 'マイクへのアクセスが許可されていません。';
+    }
+}
+
             
             // --- 3. MediaRecorder (録音機能) のセットアップ ---
             function setupMediaRecorder(stream) {

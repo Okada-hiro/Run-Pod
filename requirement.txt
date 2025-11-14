@@ -10,7 +10,7 @@ faster-whisper
 librosa
 numpy # librosa や torch の依存]
 loguru
-
+transformers
 
 # 音声合成 (Style-Bert-VITS2)
 scipy
@@ -18,6 +18,6 @@ torch # ★注意: CUDA版は別途インストール推奨
  # Style-Bert-VITS2 の BERTモデルロード用
 pyworld
 huggingface_hub
+pyopenjtalk
 num2words
-# Style-Bert-VITS2 本体 (GitHubから直接インストール)
-git+https://github.com/h-or-s/Style-Bert-VITS2.git
+

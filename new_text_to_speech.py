@@ -7,9 +7,9 @@ import numpy as np
 import sys
 
 # --- Style-Bert-TTS のインポート (変更なし) ---
-from style_bert_vits2.nlp import bert_models
-from style_bert_vits2.constants import Languages
-from style_bert_vits2.tts_model import TTSModel
+from Style_Bert_VITS2.style_bert_vits2.nlp import bert_models
+from Style_Bert_VITS2.style_bert_vits2.constants import Languages
+from Style_Bert_VITS2.style_bert_vits2.tts_model import TTSModel
 
 # --- グローバル変数の準備 (変更なし) ---
 GLOBAL_TTS_MODEL = None

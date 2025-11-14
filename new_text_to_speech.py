@@ -10,9 +10,9 @@ import sys
 
 # --- 1. Style-Bert-VITS2 リポジトリのルートを sys.path に追加 ---
 # このファイル (new_text_to_speech.py) があるディレクトリ (= /workspace)
-WORKSPACE_DIR = os.path.dirname(os.path.abspath(__file__))
+WORKSPACE_DIR = os.getcwd()
 # git clone したリポジトリのパス
-REPO_PATH = os.path.join(WORKSPACE_DIR, "Style-Bert-VITS2") 
+REPO_PATH = os.path.join(WORKSPACE_DIR, "Style_Bert_VITS2") 
 
 # sys.path にリポジトリのルートを追加
 if REPO_PATH not in sys.path:
@@ -36,7 +36,7 @@ try:
     
 except ImportError as e:
     print(f"[ERROR] Style-Bert-TTS のインポートに失敗しました。")
-    print(f"       REPO_PATH ({REPO_PATH}) が 'Style-Bert-VITS2' として存在するか確認してください。")
+    print(f"       REPO_PATH ({REPO_PATH}) が 'Style_Bert_VITS2' として存在するか確認してください。")
     print(f"       エラー詳細: {e}")
     # プログラムを停止させるためにエラーを再送出
     raise
@@ -66,7 +66,7 @@ try:
 
     # --- ★ 修正: TTSモデルのロードパス ---
     print("[INFO] Style-Bert-TTS (FT): Loading Fine-Tuned TTSModel...")
-    assets_root = Path("model_assets")
+    assets_root = Path(REPO_PATH) / "model_assets"
     
     # のご要望通り、サブディレクトリ (Ref_voice/) を使わないパスに変更
     model_path = assets_root / FT_MODEL_FILE

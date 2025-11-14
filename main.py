@@ -329,6 +329,6 @@ async def get_root():
 if __name__ == "__main__":
     # RunPodのデフォルトHTTPポート (8000など) に合わせる
     # (Hugging Face Spacesなど、環境によっては 7860 の場合もある)
-    port = int(os.environ.get("PORT", 8000))
+    port = int(os.environ.get("PORT", 5000))
     print(f"[INFO] サーバーを http://0.0.0.0:{port} で起動します。")
     uvicorn.run(app, host="0.0.0.0", port=port)

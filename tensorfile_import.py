@@ -7,6 +7,6 @@ repo_id = "okadahiroaki/new_model"
 filename = "Ref_voice_e3_s936.safetensors"
 
 # ファイルをローカルにダウンロード
-local_path = hf_hub_download(repo_id=repo_id, filename=filename, local_dir="/content/Run-Pod/Style_Bert_VITS2/model_assets")
+local_path = hf_hub_download(repo_id=repo_id, filename=filename, local_dir="Style_Bert_VITS2/model_assets")
 
 print("保存先:", local_path)

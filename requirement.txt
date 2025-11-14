@@ -5,6 +5,10 @@ uvicorn[standard] # WebSocketサポートを含む
 # OpenAI API
 openai
 
+#gemini
+google-generativeai
+
+
 # 音声認識 (Whisper)
 faster-whisper
 librosa

@@ -36,7 +36,7 @@ def generate_answer(question: str, model="gemini-2.5-flash-lite") -> str:
         return "質問を聞き取れませんでした。"
 
     answer = ""
-    system_prompt = "あなたは丁寧に質問に答えるアシスタントです。"
+    system_prompt = "あなたは丁寧かつ簡潔に質問に答えるアシスタントです。あなたの回答は音声として読み上げられるので、マークダウンではなく、文章を出力してください。"
 
     try:
         

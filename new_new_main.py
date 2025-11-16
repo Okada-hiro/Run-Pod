@@ -325,13 +325,6 @@ async def get_root():
                     vad = await window.vad.MicVAD.new({
                         stream: mediaStream, 
                         
-                        // ★★★ 修正: ログ(404)に基づき、モデルのURLを明示的に指定 ★★★
-                        // ライブラリが /silero_vad_legacy.onnx を探しに行っていたため、
-                        // CDNのフルパスを指定します。
-                        modelURL: "https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@latest/dist/silero_vad_legacy.onnx",
-                        // workletのパスも念のため明示的に指定
-                        workletURL: "https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@latest/dist/vad.worklet.min.js",
-                        
                         onSpeechStart: () => {
                             isSpeaking = true;
                             vadStatusDiv.textContent = "発話中...";

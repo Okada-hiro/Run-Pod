@@ -8,8 +8,16 @@ import os
 import asyncio
 import time
 import subprocess # ffmpeg 実行のため
-import logging # ★ 優先度1: ロギングモジュールをインポート
-import sys # ★ 優先度1: ロギング出力先指定のため
+import logging 
+import sys 
+
+# --- ロギング設定 ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)] 
+)
+logger = logging.getLogger(__name__)
 
 # --- 既存の処理モジュールをインポート ---
 try:
@@ -20,36 +28,22 @@ except ImportError:
     print("[ERROR] 必要なモジュール(transcribe_func, answer_generator, new_text_to_speech)が見つかりません。")
     exit(1)
 
-# --- ★ 優先度1: ロギング設定 ---
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    handlers=[logging.StreamHandler(sys.stdout)] # コンソールに標準出力する
-)
-logger = logging.getLogger(__name__)
-
 # --- 設定 ---
-PROCESSING_DIR = "incoming_audio" # アップロード/処理結果の保存場所
+PROCESSING_DIR = "incoming_audio" 
 MODEL_SIZE = "medium"
 LANGUAGE = "ja"
 
 # --- アプリケーション初期化 ---
 app = FastAPI()
 os.makedirs(PROCESSING_DIR, exist_ok=True)
-
-# 1. /download エンドポイント (生成された .ans.wav をブラウザに返す)
 app.mount(f"/download", StaticFiles(directory=PROCESSING_DIR), name="download")
 logger.info(f"'{PROCESSING_DIR}' ディレクトリを /download としてマウントしました。")
 
 
 # ---------------------------
-# バックグラウンド処理関数 (WebSocketオブジェクトを追加)
+# バックグラウンド処理関数 
 # ---------------------------
 async def process_audio_file(audio_path: str, original_filename: str, websocket: WebSocket):
-    """
-    アップロードされた音声ファイルを受け取り、一連の処理を実行し、
-    完了したらWebSocketでクライアントに通知する
-    """
     logger.info(f"[TASK START] ファイル処理開始: {original_filename}")
     question_text = ""
     answer_text = ""
@@ -88,14 +82,13 @@ async def process_audio_file(audio_path: str, original_filename: str, websocket:
         
         if success_tts:
             logger.info(f"[TASK] (4/4) 音声合成 完了。クライアントに通知します。")
-            # ★ 優先度2 & 3: 完了通知にテキストデータを追加
             download_url = f"/download/{answer_wav_filename}"
             await websocket.send_json({
                 "status": "complete",
                 "message": "回答の準備ができました。",
                 "audio_url": download_url,
-                "question_text": question_text, # ★ 優先度3
-                "answer_text": answer_text      # ★ 優先度3
+                "question_text": question_text, 
+                "answer_text": answer_text      
             })
         else:
             logger.warning(f"[WARN] (4/4) 音声合成に失敗しました。")
@@ -108,11 +101,10 @@ async def process_audio_file(audio_path: str, original_filename: str, websocket:
         try:
             await websocket.send_json({"status": "error", "message": f"処理中にエラーが発生しました: {e}"})
         except WebSocketDisconnect:
-            pass # クライアントが切断済みなら何もしない
+            pass 
 
 # ---------------------------
 # WebSocket エンドポイント ( /ws )
-# (ブラウザからのマイク音声データ受信)
 # ---------------------------
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -120,33 +112,28 @@ async def websocket_endpoint(websocket: WebSocket):
     logger.info("[WS] クライアントが接続しました。")
     try:
         while True:
-            # 1. ブラウザから音声データ (Blob) を受信
             audio_data = await websocket.receive_bytes()
             
-            # 2. 一時ファイルとして保存 (ブラウザからは .webm 形式が多い)
             temp_id = f"ws_{int(time.time())}"
             temp_input_path = os.path.join(PROCESSING_DIR, f"{temp_id}.webm") 
             
             with open(temp_input_path, "wb") as f:
                 f.write(audio_data)
             
-            # 3. ffmpeg で .wav に変換 (Whisperが処理できる形式へ)
             output_wav_filename = f"{temp_id}.wav"
             output_wav_path = os.path.join(PROCESSING_DIR, output_wav_filename)
             
-            # 16kHz モノラル 16bit PCM に変換
             cmd = [
                 "ffmpeg",
                 "-i", temp_input_path,
                 "-ar", "16000",
                 "-ac", "1",
                 "-c:a", "pcm_s16le",
-                "-y", # 常に上書き
+                "-y", 
                 output_wav_path
             ]
             
             logger.info(f"[WS] ffmpeg 変換実行: {temp_input_path} -> {output_wav_path}")
-            # 非同期でサブプロセスを実行
             proc = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             stdout, stderr = await proc.communicate()
             
@@ -157,17 +144,14 @@ async def websocket_endpoint(websocket: WebSocket):
             
             logger.info(f"[WS] ffmpeg 変換成功。")
             
-            # 4. バックグラウンド処理タスクを開始 (websocketオブジェクトを渡す)
             asyncio.create_task(process_audio_file(
                 output_wav_path, 
-                output_wav_filename, # .wav ファイル名を基準にする
+                output_wav_filename, 
                 websocket
             ))
             
-            # 5. クライアントに「処理中」を通知
             await websocket.send_json({"status": "processing", "message": "文字起こしと回答生成を開始しました..."})
 
-            # 6. 一時入力ファイル (webm) を削除
             if os.path.exists(temp_input_path):
                 os.remove(temp_input_path)
 
@@ -191,7 +175,7 @@ async def get_root():
     <html lang="ja">
     <head>
         <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <meta name="viewport" content="width=device.width, initial-scale=1.0">
         <title>VAD音声応答</title>
         
         <style>
@@ -237,8 +221,8 @@ async def get_root():
             <div id="downloadLink"></div>
         </div>
 
-        <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.js"></script>
-        <script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@latest/dist/bundle.min.js"></script>
+        <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.wasm.min.js"></script>
+        <script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.29/dist/bundle.min.js"></script>
 
         <script>
             // --- DOM要素 ---
@@ -284,7 +268,6 @@ async def get_root():
                     statusDiv.textContent = data.message; 
 
                     if (data.status === 'complete' && data.audio_url) {
-                        // AIの回答を再生
                         playAudio(data.audio_url); 
                         questionTextDiv.textContent = data.question_text || '（質問を聞き取れませんでした）';
                         answerTextDiv.textContent = data.answer_text || '（回答を生成できませんでした）';
@@ -292,7 +275,6 @@ async def get_root():
                         
                     } else if (data.status === 'error') {
                         answerTextDiv.textContent = `エラー: ${data.message}`;
-                        // エラー時も VAD を再開
                         vad?.start();
                         statusDiv.textContent = 'エラーが発生しました。待機中に戻ります。';
                     }
@@ -301,42 +283,47 @@ async def get_root():
                 ws.onclose = () => {
                     console.log('WebSocket 接続切断');
                     statusDiv.textContent = 'サーバーとの接続が切れました。リロードしてください。';
-                    stopVAD(); // VADも停止
+                    stopVAD(); 
                 };
             }
 
             // --- 2. VADとマイクのセットアップ ---
+            // ★★★ 修正: 提示されたコードに基づき、初期化方法を修正 ★★★
             async function setupVAD() {
                 try {
-                    // 1. VADライブラリ (bundle.min.js) がグローバルに 'vad' (小文字) を定義するのを待つ
+                    // 1. VADライブラリ (window.vad) のロードを待つ
                     while (!window.vad) {
                         console.log("VADロード待機中...");
                         await new Promise(r => setTimeout(r, 50));
                     }
                     console.log("VADライブラリ ロード完了。");
 
-                    // 2. ユーザー操作でマイクを取得
+                    // 2. マイクを取得
                     mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
 
-                    // 3. MediaRecorder のセットアップ (VADとは別に録音を管理)
+                    // 3. MediaRecorder をセットアップ
                     setupMediaRecorder(mediaStream);
 
-                    // 4. VADライブラリを初期化
+                    // 4. VADライブラリを初期化 (パスを明示的に指定)
                     vad = await window.vad.MicVAD.new({
+                        // MediaRecorder と同じマイクストリームを渡す
                         stream: mediaStream, 
                         
+                        // ★ 提示されたパス指定を追加 ★
+                        onnxWASMBasePath: "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/",
+                        baseAssetPath: "https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.29/dist/",
+                        
+                        // イベントハンドラ (既存のロジック)
                         onSpeechStart: () => {
                             isSpeaking = true;
                             vadStatusDiv.textContent = "発話中...";
                             if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
-                            // VADが発話を開始したら、MediaRecorder の録音を開始
                             if (!isRecording) startMediaRecorder(); 
                         },
                         onSpeechEnd: (audio) => {
-                            // VADが返す生のオーディオデータ(audio)は *無視* する
+                            // MediaRecorder を使っているので VAD が返す audio データは無視
                             isSpeaking = false;
                             vadStatusDiv.textContent = "発話終了 (無音タイマー起動)";
-                            // VADが発話終了したら、MediaRecorder を停止するためのタイマーを開始
                             if (isRecording) startSilenceTimer(); 
                         }
                     });
@@ -351,8 +338,9 @@ async def get_root():
                     vadStatusDiv.textContent = '待機中...';
 
                 } catch (err) {
+                    // ★ 初期化失敗時にこのエラーが出る
                     console.error('VADまたはマイクのセットアップに失敗:', err);
-                    statusDiv.textContent = 'マイクへのアクセスが許可されていません。';
+                    statusDiv.textContent = 'VADの初期化に失敗しました。';
                 }
             }
 
@@ -373,16 +361,13 @@ async def get_root():
 
                     if (audioChunks.length === 0) {
                         console.log("録音データが空です。送信をスキップします。");
-                        // AIが喋っていなければ VAD を再開
                         if (!isAISpeaking) vad?.start(); 
                         return;
                     }
 
-                    // 録音データをBlobとして結合
                     const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
-                    audioChunks = []; // チャンクをクリア
+                    audioChunks = []; 
 
-                    // WebSocketでサーバーに送信
                     if (ws && ws.readyState === WebSocket.OPEN) {
                         ws.send(audioBlob);
                         statusDiv.textContent = '音声を送信中... サーバー処理を待っています。';
@@ -395,8 +380,8 @@ async def get_root():
                 mediaRecorder.onstart = () => {
                     console.log("MediaRecorder: 録音開始。");
                     isRecording = true;
-                    audioChunks = []; // チャンクをリセット
-                    clearResults(); // 以前の結果をクリア
+                    audioChunks = []; 
+                    clearResults(); 
                 };
             }
             
@@ -408,14 +393,13 @@ async def get_root():
                         console.log("AI再生中のため、録音を開始しません。");
                         return;
                     }
-                    mediaRecorder.start(1000); // 1秒ごとにチャンクを生成
+                    mediaRecorder.start(1000); 
                 }
             }
             
             function stopMediaRecorder() {
                 if (mediaRecorder && isRecording) {
                     mediaRecorder.stop();
-                    // VADも一時停止 (サーバーの応答を待つため)
                     vad?.pause(); 
                 }
             }
@@ -428,7 +412,6 @@ async def get_root():
                 silenceTimer = setTimeout(() => {
                     console.log(`無音時間が ${SILENCE_THRESHOLD_MS}ms に達しました。`);
                     if (isRecording && !isSpeaking) {
-                        // 発話中でなく、録音中であれば、録音を停止（＝サーバーへ送信）
                         vadStatusDiv.textContent = "無音検出。サーバーへ送信します。";
                         stopMediaRecorder();
                     }
@@ -462,7 +445,6 @@ async def get_root():
             }
 
             function playAudio(url) {
-                // AIが話し始めるので VAD を一時停止 (AIの声を拾わないように)
                 vad?.pause(); 
                 isAISpeaking = true;
                 
@@ -471,7 +453,6 @@ async def get_root():
                 audio.controls = true;
                 audio.autoplay = true;
                 
-                // ★ 再生が終了したら VAD を再開
                 audio.onended = () => {
                     console.log("AIの再生完了。VADを再開します。");
                     isAISpeaking = false;
@@ -512,8 +493,6 @@ async def get_root():
 # サーバー起動
 # ---------------------------
 if __name__ == "__main__":
-    # RunPodのデフォルトHTTPポート (8000など) に合わせる
     port = int(os.environ.get("PORT", 5000))
     logger.info(f"サーバーを http://0.0.0.0:{port} で起動します。")
-    # ★ 優先度1: Uvicornのロギングをカスタムロガーに合わせる
     uvicorn.run(app, host="0.0.0.0", port=port, log_config=None)

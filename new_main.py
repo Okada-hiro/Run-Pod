@@ -175,7 +175,7 @@ async def get_root():
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device.width, initial-scale=1.0">
-        <title>VAD音声応答 (割り込みOK)</title>
+        <title>VAD音声応答 (常時割り込みOK)</title>
         
         <style>
             body { font-family: sans-serif; display: grid; place-items: center; min-height: 90vh; background: #f4f4f4; }
@@ -260,13 +260,24 @@ async def get_root():
                     startButton.disabled = false;
                 };
 
+                // ★★★ 修正箇所 1: サーバー応答時の処理 ★★★
                 ws.onmessage = (event) => {
                     const data = JSON.parse(event.data);
                     console.log('サーバーからメッセージ:', data);
+
+                    // ★ 修正: サーバーからの応答時に、既に次の録音が始まっているかチェック
+                    // もし isRecording == true なら、ユーザーが割り込んだと判断し、
+                    // この（古い）応答は破棄する
+                    if (data.status === 'complete' && isRecording) {
+                        console.log("ユーザーが次の発話を開始しているため、古い応答を破棄します。");
+                        // VADは動き続けており、録音も続行しているので何もしない
+                        return;
+                    }
                     
                     statusDiv.textContent = data.message; 
 
                     if (data.status === 'complete' && data.audio_url) {
+                        // (isRecording は false のはずなので、) AIの回答を再生
                         playAudio(data.audio_url); 
                         questionTextDiv.textContent = data.question_text || '（質問を聞き取れませんでした）';
                         answerTextDiv.textContent = data.answer_text || '（回答を生成できませんでした）';
@@ -274,8 +285,11 @@ async def get_root():
                         
                     } else if (data.status === 'error') {
                         answerTextDiv.textContent = `エラー: ${data.message}`;
-                        vad?.start();
-                        statusDiv.textContent = 'エラーが発生しました。待機中に戻ります。';
+                        // ★ 修正: VADは停止していないので、start()は不要。ステータスを戻す
+                        if (!isRecording && !isSpeaking) { // ユーザーが話していない時だけ
+                            statusDiv.textContent = 'エラーが発生しました。待機中に戻ります。';
+                            vadStatusDiv.textContent = '待機中...';
+                        }
                     }
                 };
 
@@ -341,13 +355,15 @@ async def get_root():
                     }
                 };
 
+                // ★★★ 修正箇所 2: onstop 処理 ★★★
                 mediaRecorder.onstop = () => {
                     console.log("MediaRecorder: 録音停止。");
                     isRecording = false;
 
                     if (audioChunks.length === 0) {
                         console.log("録音データが空です。送信をスキップします。");
-                        if (!isAISpeaking) vad?.start(); 
+                        // ★ 修正: VADは停止していないので、start()を削除
+                        // if (!isAISpeaking) vad?.start(); 
                         return;
                     }
 
@@ -372,29 +388,31 @@ async def get_root():
             }
             
             // --- 4. 録音の開始/停止制御 ---
-            // ★★★ 修正箇所 1 ★★★
+            
             function startMediaRecorder() {
                 if (mediaRecorder && !isRecording) {
-                    // ★ 修正: AI再生中の録音ガード (if (isAISpeaking)) を削除
+                    // (前回の修正: AI再生中のガードは削除済み)
                     
-                    // もしAIが喋っている最中に録音を開始したら、AIの再生を停止する (オプション)
+                    // もしAIが喋っている最中に録音を開始したら、AIの再生を停止する
                     const aiAudio = audioPlayback.querySelector('audio');
                     if (aiAudio && !aiAudio.paused) {
                         aiAudio.pause();
-                        aiAudio.currentTime = 0; // 必要なら先頭に戻す
+                        aiAudio.currentTime = 0; 
                         console.log("AIの再生を中断しました。");
-                        isAISpeaking = false; // AI再生状態をリセット
+                        isAISpeaking = false; 
                     }
 
                     mediaRecorder.start(1000); 
                 }
             }
             
+            // ★★★ 修正箇所 3: stopMediaRecorder ★★★
             function stopMediaRecorder() {
                 if (mediaRecorder && isRecording) {
                     mediaRecorder.stop();
-                    // VADはサーバー応答を待つために一時停止 (これは割り込みとは別)
-                    vad?.pause(); 
+                    // ★ 修正: サーバー応答を待つためのVAD一時停止を削除
+                    // これでサーバー処理中もVADが動き続ける
+                    // vad?.pause(); 
                 }
             }
 
@@ -438,9 +456,8 @@ async def get_root():
                 answerTextDiv.textContent = '';
             }
 
-            // ★★★ 修正箇所 2 ★★★
             function playAudio(url) {
-                // ★ 修正: VADの一時停止 (vad?.pause()) を削除
+                // (前回の修正: VADのpause/startは削除済み)
                 isAISpeaking = true;
                 
                 audioPlayback.innerHTML = '';
@@ -451,7 +468,6 @@ async def get_root():
                 audio.onended = () => {
                     console.log("AIの再生完了。"); // VADは動き続けている
                     isAISpeaking = false;
-                    // ★ 修正: VADの再開 (vad?.start()) を削除
                     
                     // ユーザーが割り込んでいなければ、ステータスを待機中に戻す
                     if (!isSpeaking) { 

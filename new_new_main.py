@@ -197,8 +197,6 @@ async def get_root():
         <style>
             body { font-family: sans-serif; display: grid; place-items: center; min-height: 90vh; background: #f4f4f4; }
             #container { background: white; padding: 2rem; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); text-align: center; width: 90%; max-width: 600px; }
-            
-            /* ★ ボタンのスタイル変更 */
             #startButton { 
                 font-size: 1.2rem; padding: 0.8rem 1.5rem; border: none; 
                 border-radius: 5px; cursor: pointer; margin: 0.5rem; 
@@ -207,11 +205,8 @@ async def get_root():
             #startButton:disabled { background: #ccc; }
             #stopButton { background: #dc3545; color: white; font-size: 1rem; padding: 0.5rem 1rem; }
             #stopButton:disabled { display: none; }
-
             #status { margin-top: 1.5rem; font-size: 1.1rem; color: #333; min-height: 2em; }
             #vad-status { font-size: 0.9rem; color: #666; height: 1.5em; }
-
-            /* ... (qa-display, audioPlayback, downloadLink のスタイルは変更なし) ... */
             #qa-display { margin: 1.5rem auto 0 auto; text-align: left; width: 100%; border-top: 1px solid #eee; padding-top: 1rem; }
             #qa-display div { margin-bottom: 1rem; padding: 0.5rem; background: #f9f9f9; border-radius: 5px; white-space: pre-wrap; word-wrap: break-word; }
             #qa-display div:empty { display: none; }
@@ -311,7 +306,6 @@ async def get_root():
             }
 
             // --- 2. VADとマイクのセットアップ ---
-            // ★★★ 関数全体を修正 ★★★
             async function setupVAD() {
                 try {
                     // 1. VADライブラリ (bundle.min.js) がグローバルに 'vad' (小文字) を定義するのを待つ
@@ -327,12 +321,16 @@ async def get_root():
                     // 3. MediaRecorder のセットアップ (VADとは別に録音を管理)
                     setupMediaRecorder(mediaStream);
 
-                    // 4. VADライブラリを初期化 (新しい MicVAD.new インターフェースを使用)
+                    // 4. VADライブラリを初期化
                     vad = await window.vad.MicVAD.new({
-                        // ★ VADライブラリにも MediaRecorder と同じマイクストリームを渡す
-                        // (これが失敗する場合、VADは独自にマイクを取得しようとする可能性があるが、
-                        //  イベントトリガーとしては機能するはず)
                         stream: mediaStream, 
+                        
+                        // ★★★ 修正: ログ(404)に基づき、モデルのURLを明示的に指定 ★★★
+                        // ライブラリが /silero_vad_legacy.onnx を探しに行っていたため、
+                        // CDNのフルパスを指定します。
+                        modelURL: "https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@latest/dist/silero_vad_legacy.onnx",
+                        // workletのパスも念のため明示的に指定
+                        workletURL: "https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@latest/dist/vad.worklet.min.js",
                         
                         onSpeechStart: () => {
                             isSpeaking = true;
@@ -343,7 +341,6 @@ async def get_root():
                         },
                         onSpeechEnd: (audio) => {
                             // VADが返す生のオーディオデータ(audio)は *無視* する
-                            // (MediaRecorder が録音しているため)
                             isSpeaking = false;
                             vadStatusDiv.textContent = "発話終了 (無音タイマー起動)";
                             // VADが発話終了したら、MediaRecorder を停止するためのタイマーを開始
@@ -414,8 +411,6 @@ async def get_root():
             
             function startMediaRecorder() {
                 if (mediaRecorder && !isRecording) {
-                    // AIが喋っている場合は、録音を開始しない (割り込みを許可しない場合)
-                    // ※ 割り込みたい場合は、この if を削除し、playAudio で vad.pause() も削除する
                     if (isAISpeaking) {
                         console.log("AI再生中のため、録音を開始しません。");
                         return;
@@ -450,7 +445,7 @@ async def get_root():
 
             // --- 6. VADの停止 (クリーンアップ) ---
             function stopVAD() {
-                vad?.destroy(); // (vad.MicVAD.new で作成したインスタンスを破棄)
+                vad?.destroy(); 
                 vad = null;
                 mediaStream?.getTracks().forEach(track => track.stop());
                 mediaStream = null;

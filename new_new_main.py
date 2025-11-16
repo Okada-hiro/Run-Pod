@@ -185,6 +185,7 @@ async def websocket_endpoint(websocket: WebSocket):
 # ---------------------------
 @app.get("/", response_class=HTMLResponse)
 async def get_root():
+    # ★★★ HTML部分を修正 ★★★
     return """
     <!DOCTYPE html>
     <html lang="ja">
@@ -192,13 +193,6 @@ async def get_root():
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>VAD音声応答</title>
-        
-        <script type="module">
-          import { VAD, utils } from 'https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.1.0/dist/bundle.mjs';
-          // VAD機能をグローバルスコープに割り当てて、下の <script> から使えるようにする
-          window.VAD = VAD;
-          window.VADUtils = utils;
-        </script>
         
         <style>
             body { font-family: sans-serif; display: grid; place-items: center; min-height: 90vh; background: #f4f4f4; }
@@ -248,6 +242,9 @@ async def get_root():
             <div id="downloadLink"></div>
         </div>
 
+        <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.js"></script>
+        <script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@latest/dist/bundle.min.js"></script>
+
         <script>
             // --- DOM要素 ---
             const startButton = document.getElementById('startButton');
@@ -263,7 +260,7 @@ async def get_root():
             let ws;
             let mediaRecorder;
             let audioChunks = [];
-            let vad;
+            let vad; // (VADインスタンス)
             let mediaStream; // マイクストリーム
             let silenceTimer = null; // 無音検出タイマー
             let isRecording = false; // MediaRecorder が録音中か
@@ -314,55 +311,60 @@ async def get_root():
             }
 
             // --- 2. VADとマイクのセットアップ ---
+            // ★★★ 関数全体を修正 ★★★
             async function setupVAD() {
-    try {
-        // ★★★ 修正箇所 (ここから) ★★★
-        // window.VAD が未定義ならロード完了を待つ
-        // (head 内の <script type="module"> の読み込みが遅れる場合があるため)
-        while (!window.VAD) {
-            console.log("VADロード待機中...");
-            await new Promise(r => setTimeout(r, 50));
-        }
-        // ★★★ 修正箇所 (ここまで) ★★★
+                try {
+                    // 1. VADライブラリ (bundle.min.js) がグローバルに 'vad' (小文字) を定義するのを待つ
+                    while (!window.vad) {
+                        console.log("VADロード待機中...");
+                        await new Promise(r => setTimeout(r, 50));
+                    }
+                    console.log("VADライブラリ ロード完了。");
 
-        // 1. ユーザー操作でマイクを取得（ここで許可ダイアログが出る）
-        mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                    // 2. ユーザー操作でマイクを取得
+                    mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
 
-        // 2. MediaRecorder のセットアップ
-        setupMediaRecorder(mediaStream);
+                    // 3. MediaRecorder のセットアップ (VADとは別に録音を管理)
+                    setupMediaRecorder(mediaStream);
 
-        // 3. VADライブラリを初期化（取得したマイクストリームを渡す）
-        vad = await window.VAD.create({
-            workletURL: 'https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.1.0/dist/vad.worklet.mjs',
-            modelURL: 'https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.1.0/dist/silero_vad.onnx',
-            audioStream: mediaStream,
-            onSpeechStart: () => {
-                isSpeaking = true;
-                vadStatusDiv.textContent = "発話中...";
-                if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
-                if (!isRecording) startMediaRecorder();
-            },
-            onSpeechEnd: () => {
-                isSpeaking = false;
-                vadStatusDiv.textContent = "発話終了 (無音タイマー起動)";
-                if (isRecording) startSilenceTimer();
+                    // 4. VADライブラリを初期化 (新しい MicVAD.new インターフェースを使用)
+                    vad = await window.vad.MicVAD.new({
+                        // ★ VADライブラリにも MediaRecorder と同じマイクストリームを渡す
+                        // (これが失敗する場合、VADは独自にマイクを取得しようとする可能性があるが、
+                        //  イベントトリガーとしては機能するはず)
+                        stream: mediaStream, 
+                        
+                        onSpeechStart: () => {
+                            isSpeaking = true;
+                            vadStatusDiv.textContent = "発話中...";
+                            if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
+                            // VADが発話を開始したら、MediaRecorder の録音を開始
+                            if (!isRecording) startMediaRecorder(); 
+                        },
+                        onSpeechEnd: (audio) => {
+                            // VADが返す生のオーディオデータ(audio)は *無視* する
+                            // (MediaRecorder が録音しているため)
+                            isSpeaking = false;
+                            vadStatusDiv.textContent = "発話終了 (無音タイマー起動)";
+                            // VADが発話終了したら、MediaRecorder を停止するためのタイマーを開始
+                            if (isRecording) startSilenceTimer(); 
+                        }
+                    });
+
+                    // 5. VAD を開始
+                    vad.start();
+
+                    // 6. ボタン・ステータス更新
+                    startButton.disabled = true;
+                    stopButton.disabled = false;
+                    statusDiv.textContent = 'マイク起動完了。話しかけてください。';
+                    vadStatusDiv.textContent = '待機中...';
+
+                } catch (err) {
+                    console.error('VADまたはマイクのセットアップに失敗:', err);
+                    statusDiv.textContent = 'マイクへのアクセスが許可されていません。';
+                }
             }
-        });
-
-        // 4. VAD を開始
-        vad.start();
-
-        // 5. ボタン・ステータス更新
-        startButton.disabled = true;
-        stopButton.disabled = false;
-        statusDiv.textContent = 'マイク起動完了。話しかけてください。';
-        vadStatusDiv.textContent = '待機中...';
-
-    } catch (err) {
-        console.error('VADまたはマイクのセットアップに失敗:', err);
-        statusDiv.textContent = 'マイクへのアクセスが許可されていません。';
-    }
-}
 
             
             // --- 3. MediaRecorder (録音機能) のセットアップ ---
@@ -448,7 +450,7 @@ async def get_root():
 
             // --- 6. VADの停止 (クリーンアップ) ---
             function stopVAD() {
-                vad?.destroy();
+                vad?.destroy(); // (vad.MicVAD.new で作成したインスタンスを破棄)
                 vad = null;
                 mediaStream?.getTracks().forEach(track => track.stop());
                 mediaStream = null;

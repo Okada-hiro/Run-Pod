@@ -99,28 +99,29 @@ async def process_audio_file(audio_path: str, original_filename: str, websocket:
         )
         
         if success_tts:
-            logger.info(f"[TASK] (4/4) 音声合成 完了。クライアントにBase64データを送信します。")
+            logger.info(f"[TASK] (4/4) 音声合成 完了。クライアントにバイナリデータを送信します。")
             
-            # ★★★ 変更点：URLの代わりにBase64データを送信 ★★★
             try:
-                with open(answer_wav_path_abs, "rb") as audio_file:
-                    audio_data = audio_file.read()
-                    audio_base64 = base64.b64encode(audio_data).decode('utf-8')
-                
-                # 最終完了通知 (データを直接送る)
+                # 1. メタデータ（テキスト情報など）を先にJSONで送る
                 await websocket.send_json({
                     "status": "complete",
                     "message": "再生を開始します。",
-                    "audio_base64": audio_base64, # URLの代わり
                     "question_text": question_text, 
-                    "answer_text": answer_text      
+                    "answer_text": answer_text,
+                    "mode": "binary_audio_next" # クライアントに「次は音声だよ」と伝える目印（なくても判定可能だが親切）
                 })
+
+                # 2. 音声データをバイナリ(Bytes)として直接送る
+                # ★ ここでBase64エンコードをせず、生データを送ることでサーバー負荷もクライアント負荷も下がる
+                with open(answer_wav_path_abs, "rb") as audio_file:
+                    audio_data = audio_file.read()
+                    await websocket.send_bytes(audio_data)
                 
-                # # 送信後、WAVファイルは削除してもよい (ディスク節約)
-                # if os.path.exists(answer_wav_path_abs):
-                #     os.remove(answer_wav_path_abs)
-                # if os.path.exists(audio_path): # 元のWAVも
-                #     os.remove(audio_path)
+                logger.info(f"[TASK] バイナリ音声データ送信完了 ({len(audio_data)} bytes)")
+
+            except FileNotFoundError:
+                 logger.error(f"[TASK ERROR] 生成した音声ファイルが見つかりません: {answer_wav_path_abs}")
+                 await websocket.send_json({"status": "error", "message": "音声ファイルの読み込みに失敗しました。"})
 
             except FileNotFoundError:
                  logger.error(f"[TASK ERROR] 生成した音声ファイルが見つかりません: {answer_wav_path_abs}")
@@ -291,9 +292,8 @@ async def get_root():
             let isSpeaking = false; 
             let isAISpeaking = false; 
             let currentAudio = null; 
-            let currentAudioUrl = null; // Blob URLを保持
+            let currentAudioUrl = null; 
             
-            // ★ VADの待ち時間。800msのまま。短くしたい場合は 600 などに
             const SILENCE_THRESHOLD_MS = 800; 
 
             // --- 1. WebSocket接続 ---
@@ -302,6 +302,9 @@ async def get_root():
                 const wsUrl = wsProtocol + window.location.host + '/ws';
                 
                 ws = new WebSocket(wsUrl);
+                
+                // ★重要: バイナリデータを受信できるように設定
+                ws.binaryType = 'arraybuffer';
 
                 ws.onopen = () => {
                     console.log('WebSocket 接続成功');
@@ -310,39 +313,20 @@ async def get_root():
                 };
 
                 ws.onmessage = (event) => {
-                    const data = JSON.parse(event.data);
-                    console.log('サーバーからメッセージ:', data);
-                    
-                    if (data.message) {
-                        statusDiv.textContent = data.message;
-                    }
-
-                    if (data.status === 'processing') {
-                        questionTextDiv.textContent = '(聞き取っています...)';
-                        answerTextDiv.textContent = '';
-                        vad?.pause(); 
-
-                    } else if (data.status === 'transcribed') {
-                        questionTextDiv.textContent = data.question_text;
-                        answerTextDiv.textContent = '(回答を生成しています...)';
-
-                    } else if (data.status === 'answered') {
-                        answerTextDiv.textContent = data.answer_text;
-
-                    // ★★★ 変更点： audio_url の代わりに audio_base64 を受信 ★★★
-                    } else if (data.status === 'complete' && data.audio_base64) {
-                        if(data.question_text) questionTextDiv.textContent = data.question_text;
-                        if(data.answer_text) answerTextDiv.textContent = data.answer_text;
-                        
-                        // Base64から音声再生＆リンク作成
-                        playAudioFromBase64(data.audio_base64); 
-                        
-                    } else if (data.status === 'error') {
-                        answerTextDiv.textContent = `エラー: ${data.message}`;
-                        statusDiv.textContent = 'エラーが発生しました。待機中に戻ります。';
-                        isAISpeaking = false;
-                        interruptButton.disabled = true; 
-                        vad?.start();
+                    // 受信データがバイナリ(音声)かテキスト(JSON)かで分岐
+                    if (event.data instanceof ArrayBuffer) {
+                        console.log(`音声バイナリ受信: ${event.data.byteLength} bytes`);
+                        // バイナリが来たら即座にBlob化して再生
+                        const audioBlob = new Blob([event.data], { type: 'audio/wav' });
+                        playAudioFromBlob(audioBlob);
+                    } else {
+                        // テキスト(JSON)の場合
+                        try {
+                            const data = JSON.parse(event.data);
+                            handleJsonMessage(data);
+                        } catch (e) {
+                            console.error("JSONパースエラー", e);
+                        }
                     }
                 };
 
@@ -351,6 +335,37 @@ async def get_root():
                     statusDiv.textContent = 'サーバーとの接続が切れました。リロードしてください。';
                     stopVAD(); 
                 };
+            }
+
+            // JSONメッセージの処理分離
+            function handleJsonMessage(data) {
+                if (data.message) statusDiv.textContent = data.message;
+
+                if (data.status === 'processing') {
+                    questionTextDiv.textContent = '(聞き取っています...)';
+                    answerTextDiv.textContent = '';
+                    vad?.pause(); 
+
+                } else if (data.status === 'transcribed') {
+                    questionTextDiv.textContent = data.question_text;
+                    answerTextDiv.textContent = '(回答を生成しています...)';
+
+                } else if (data.status === 'answered') {
+                    answerTextDiv.textContent = data.answer_text;
+
+                } else if (data.status === 'complete') {
+                    // テキスト情報の更新だけ行い、音声は直後のバイナリ受信を待つ
+                    if(data.question_text) questionTextDiv.textContent = data.question_text;
+                    if(data.answer_text) answerTextDiv.textContent = data.answer_text;
+                    // ここでは再生しない（バイナリ受信イベントで再生）
+                    
+                } else if (data.status === 'error') {
+                    answerTextDiv.textContent = `エラー: ${data.message}`;
+                    statusDiv.textContent = 'エラーが発生しました。待機中に戻ります。';
+                    isAISpeaking = false;
+                    interruptButton.disabled = true; 
+                    vad?.start();
+                }
             }
 
             // --- 2. VADとマイクのセットアップ ---
@@ -383,7 +398,6 @@ async def get_root():
                     });
 
                     vad.start();
-
                     startButton.disabled = true;
                     stopButton.disabled = false;
                     interruptButton.disabled = true;
@@ -391,20 +405,17 @@ async def get_root():
                     vadStatusDiv.textContent = '待機中...';
 
                 } catch (err) {
-                    console.error('VADまたはマイクのセットアップに失敗:', err);
+                    console.error('VAD設定エラー:', err);
                     statusDiv.textContent = 'VADの初期化に失敗しました。';
                 }
             }
 
             // --- 3. MediaRecorder のセットアップ ---
             function setupMediaRecorder(stream) {
-                // 圧縮形式 (WebM/Opus) で送信
                 mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' });
-                
                 mediaRecorder.ondataavailable = (event) => {
                     if (event.data.size > 0) audioChunks.push(event.data);
                 };
-
                 mediaRecorder.onstop = () => {
                     isRecording = false;
                     if (audioChunks.length === 0) {
@@ -414,13 +425,12 @@ async def get_root():
                     const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
                     audioChunks = []; 
                     if (ws && ws.readyState === WebSocket.OPEN) {
-                        ws.send(audioBlob);
+                        ws.send(audioBlob); // これもバイナリ送信
                         statusDiv.textContent = '音声を送信中...';
                         vadStatusDiv.textContent = 'サーバー処理中...';
                         vad?.pause(); 
                     }
                 };
-                
                 mediaRecorder.onstart = () => {
                     isRecording = true;
                     audioChunks = []; 
@@ -428,10 +438,7 @@ async def get_root():
             }
             
             function startMediaRecorder() {
-                if (mediaRecorder && !isRecording) {
-                    if (isAISpeaking) return;
-                    mediaRecorder.start(1000); 
-                }
+                if (mediaRecorder && !isRecording && !isAISpeaking) mediaRecorder.start(); 
             }
             
             function stopMediaRecorder() {
@@ -458,111 +465,92 @@ async def get_root():
                 mediaStream = null;
                 if (mediaRecorder && isRecording) mediaRecorder.stop();
                 isRecording = false;
-                
                 startButton.disabled = false;
                 stopButton.disabled = true;
                 interruptButton.disabled = true;
                 statusDiv.textContent = 'マイクが停止しました。';
-                vadStatusDiv.textContent = '';
             }
             
             // --- 7. ユーティリティ & 再生制御 ---
             
-            // ★★★ 変更点：Base64から再生・リンク作成する関数 ★★★
-            function playAudioFromBase64(base64String) {
+            // ★★★ Base64デコードを廃止し、Blobを直接扱う高速版 ★★★
+            function playAudioFromBlob(audioBlob) {
                 vad?.pause(); 
                 isAISpeaking = true;
                 statusDiv.textContent = '音声回答を再生中...';
                 interruptButton.disabled = false;
                 
-                // 以前のBlob URLがあれば解放
+                // 以前のURL解放
                 if (currentAudioUrl) {
                     URL.revokeObjectURL(currentAudioUrl);
-                    currentAudioUrl = null;
                 }
                 
-                // Base64をデコードしてBlobを作成
-                const binaryString = window.atob(base64String);
-                const len = binaryString.length;
-                const bytes = new Uint8Array(len);
-                for (let i = 0; i < len; i++) {
-                    bytes[i] = binaryString.charCodeAt(i);
-                }
-                const audioBlob = new Blob([bytes], { type: 'audio/wav' });
-                
-                // メモリ上のBlobへのURLを生成 (HTTPリクエスト不要！)
                 currentAudioUrl = URL.createObjectURL(audioBlob);
                 
-                // 1. 音声再生
                 audioPlayback.innerHTML = '';
                 if (currentAudio) { currentAudio.pause(); }
                 
                 currentAudio = new Audio(currentAudioUrl);
                 currentAudio.controls = true;
-                currentAudio.autoplay = true; // 即時再生
+                
+                // 再生準備ができ次第再生 (canplaythrough イベントも考慮可だが autoplayで十分)
+                currentAudio.autoplay = true; 
                 
                 currentAudio.onended = () => {
                     console.log("再生完了。");
-                    finishPlayback(); // VAD再開などの処理
+                    finishPlayback(); 
                 };
                 
+                // エラーハンドリング追加 (WAV破損時など)
+                currentAudio.onerror = (e) => {
+                    console.error("再生エラー", e);
+                    statusDiv.textContent = "再生エラーが発生しました。";
+                    finishPlayback();
+                };
+
                 audioPlayback.appendChild(currentAudio);
                 
-                // 2. ダウンロードリンク作成
+                // ダウンロードリンク
                 downloadLinkDiv.innerHTML = '';
                 const a = document.createElement('a');
-                a.href = currentAudioUrl; // 再生と同じメモリURL
+                a.href = currentAudioUrl;
                 a.textContent = '回答音声をダウンロード';
                 a.download = `answer_${Date.now()}.wav`; 
                 downloadLinkDiv.appendChild(a);
             }
 
-            // 再生終了時（自然終了または中断時）の処理
             function finishPlayback() {
                 isAISpeaking = false;
-                interruptButton.disabled = true; // ボタンを無効化
+                interruptButton.disabled = true; 
                 if (currentAudio) {
                     currentAudio.pause();
                     currentAudio = null;
                 }
-                
-                // メモリリーク防止のため、URLは保持しておくが
-                // 次の再生時に古いのを解放する (interruptAudioとの兼ね合い)
-                
-                vad?.start(); // VAD再開
+                vad?.start(); 
                 statusDiv.textContent = '待機中... 話しかけてください。';
                 vadStatusDiv.textContent = '待機中...';
             }
 
-            // ★ 中断ボタンが押された時の処理
             function interruptAudio() {
                 if (currentAudio) {
                     console.log("ユーザー操作により再生を中断します。");
-                    currentAudio.pause(); // 音声を停止
+                    currentAudio.pause();
                     currentAudio = null;
                 }
-                
-                // UIリセット
                 audioPlayback.innerHTML = '';
-                // ダウンロードリンクは残しても良い
-                
-                // finishPlaybackとほぼ同じ処理を実行
                 finishPlayback();
-                
                 statusDiv.textContent = '中断しました。どうぞお話しください。';
-                vadStatusDiv.textContent = '聞き取り待機中...';
             }
 
             // --- 8. イベント ---
             startButton.onclick = setupVAD;
             stopButton.onclick = stopVAD;
-            interruptButton.onclick = interruptAudio; // 中断イベント登録
+            interruptButton.onclick = interruptAudio; 
 
             window.onload = () => {
                 startButton.disabled = true;
                 connectWebSocket();
             };
-
         </script>
     </body>
     </html>

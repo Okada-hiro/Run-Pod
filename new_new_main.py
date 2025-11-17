@@ -299,7 +299,7 @@ async def get_root():
             let currentAudio = null; 
             let currentAudioUrl = null; 
             
-            const SILENCE_THRESHOLD_MS = 800; 
+            const SILENCE_THRESHOLD_MS = 200; 
 
             // --- 1. WebSocket接続 ---
             function connectWebSocket() {
@@ -386,6 +386,12 @@ async def get_root():
                         stream: mediaStream, 
                         onnxWASMBasePath: "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/",
                         baseAssetPath: "https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.29/dist/",
+
+                        // ★★★ ここを追加・調整 ★★★
+                        positiveSpeechThreshold: 0.8, // 発話開始判定の閾値（0.5〜0.9）。ノイズで誤作動しないよう高めに。
+                        negativeSpeechThreshold: 0.6, // 【重要】発話終了判定の閾値（0.35 -> 0.6）。ここを上げると、声が小さくなった瞬間に即座に「終了」とみなします。
+                        redemptionFrames: 5,          // 【重要】無音になってから「終了」と確定するまでの猶予フレーム数。減らすと「発話終了」表示が早くなります。
+                        minSpeechFrames: 4,           // ノイズによる一瞬の誤検知を防ぐ最小フレーム数。
                         
                         onSpeechStart: () => {
                             if (isAISpeaking) return; 

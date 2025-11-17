@@ -263,7 +263,7 @@ async def get_root():
             let isSpeaking = false; // VAD が発話を検知中か
             let isAISpeaking = false; // AIが再生中か
             
-            const SILENCE_THRESHOLD_MS = 2000; // 2秒間の無音で録音停止
+            const SILENCE_THRESHOLD_MS = 800; // 2秒間の無音で録音停止
 
             // --- 1. WebSocket接続 ---
             function connectWebSocket() {

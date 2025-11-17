@@ -58,10 +58,24 @@ async def process_audio_file(audio_path: str, original_filename: str, websocket:
         )
         logger.info(f"[TASK] (1/4) 文字起こし完了: {question_text}")
 
+        # ★★★ 変更点1: 文字起こし完了時点でクライアントに通知 ★★★
+        await websocket.send_json({
+            "status": "transcribed",
+            "message": "文字起こし完了。回答を生成中...",
+            "question_text": question_text
+        })
+
         # --- 2. 回答生成 (OpenAI) ---
         logger.info(f"[TASK] (2/4) 回答生成中...")
         answer_text = await asyncio.to_thread(generate_answer, question_text)
         logger.info(f"[TASK] (2/4) 回答生成完了: {answer_text[:30]}...")
+
+        # ★★★ 変更点2: 回答生成完了時点でクライアントに通知 ★★★
+        await websocket.send_json({
+            "status": "answered",
+            "message": "回答生成完了。音声を合成中...",
+            "answer_text": answer_text
+        })
 
         # --- 3. 回答の保存 (.txt) ---
         logger.info(f"[TASK] (3/4) 回答テキスト保存中...")
@@ -83,10 +97,13 @@ async def process_audio_file(audio_path: str, original_filename: str, websocket:
         if success_tts:
             logger.info(f"[TASK] (4/4) 音声合成 完了。クライアントに通知します。")
             download_url = f"/download/{answer_wav_filename}"
+            
+            # 最終完了通知
             await websocket.send_json({
                 "status": "complete",
-                "message": "回答の準備ができました。",
+                "message": "再生を開始します。",
                 "audio_url": download_url,
+                # 念のためここでもテキストを送るが、通常は既に表示済み
                 "question_text": question_text, 
                 "answer_text": answer_text      
             })
@@ -144,14 +161,15 @@ async def websocket_endpoint(websocket: WebSocket):
             
             logger.info(f"[WS] ffmpeg 変換成功。")
             
+            # 処理開始通知
+            await websocket.send_json({"status": "processing", "message": "音声を認識しています..."})
+
             asyncio.create_task(process_audio_file(
                 output_wav_path, 
                 output_wav_filename, 
                 websocket
             ))
             
-            await websocket.send_json({"status": "processing", "message": "文字起こしと回答生成を開始しました..."})
-
             if os.path.exists(temp_input_path):
                 os.remove(temp_input_path)
 
@@ -160,7 +178,10 @@ async def websocket_endpoint(websocket: WebSocket):
     except Exception as e:
         logger.error(f"[WS ERROR] WebSocketエラー: {e}", exc_info=True)
     finally:
-        await websocket.close()
+        try:
+            await websocket.close()
+        except:
+            pass
 
 
 # ---------------------------
@@ -175,7 +196,7 @@ async def get_root():
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device.width, initial-scale=1.0">
-        <title>VAD音声応答 (常時割り込みOK)</title>
+        <title>VAD音声応答</title>
         
         <style>
             body { font-family: sans-serif; display: grid; place-items: center; min-height: 90vh; background: #f4f4f4; }
@@ -188,11 +209,14 @@ async def get_root():
             #startButton:disabled { background: #ccc; }
             #stopButton { background: #dc3545; color: white; font-size: 1rem; padding: 0.5rem 1rem; }
             #stopButton:disabled { display: none; }
-            #status { margin-top: 1.5rem; font-size: 1.1rem; color: #333; min-height: 2em; }
+            #status { margin-top: 1.5rem; font-size: 1.1rem; color: #333; min-height: 2em; font-weight: bold; }
             #vad-status { font-size: 0.9rem; color: #666; height: 1.5em; }
             #qa-display { margin: 1.5rem auto 0 auto; text-align: left; width: 100%; border-top: 1px solid #eee; padding-top: 1rem; }
-            #qa-display div { margin-bottom: 1rem; padding: 0.5rem; background: #f9f9f9; border-radius: 5px; white-space: pre-wrap; word-wrap: break-word; }
-            #qa-display div:empty { display: none; }
+            #qa-display div { margin-bottom: 1rem; padding: 0.8rem; background: #f9f9f9; border-radius: 5px; white-space: pre-wrap; word-wrap: break-word; }
+            
+            /* 空でも非表示にしない（プレースホルダーが見えるようにする等の調整はお好みで） */
+            /* #qa-display div:empty { display: none; } */
+
             #question-text::before { content: '■ あなたの質問:'; font-weight: bold; display: block; margin-bottom: 0.3rem; color: #007bff;}
             #answer-text::before { content: '■ AIの回答:'; font-weight: bold; display: block; margin-bottom: 0.3rem; color: #28a745;}
             #audioPlayback { margin-top: 1rem; }
@@ -238,14 +262,14 @@ async def get_root():
             let ws;
             let mediaRecorder;
             let audioChunks = [];
-            let vad; 
-            let mediaStream; 
-            let silenceTimer = null; 
-            let isRecording = false; 
-            let isSpeaking = false; 
-            let isAISpeaking = false; 
+            let vad; // (VADインスタンス)
+            let mediaStream; // マイクストリーム
+            let silenceTimer = null; // 無音検出タイマー
+            let isRecording = false; // MediaRecorder が録音中か
+            let isSpeaking = false; // VAD が発話を検知中か
+            let isAISpeaking = false; // AIが再生中か
             
-            const SILENCE_THRESHOLD_MS = 2000; 
+            const SILENCE_THRESHOLD_MS = 2000; // 2秒間の無音で録音停止
 
             // --- 1. WebSocket接続 ---
             function connectWebSocket() {
@@ -260,36 +284,49 @@ async def get_root():
                     startButton.disabled = false;
                 };
 
-                // ★★★ 修正箇所 1: サーバー応答時の処理 ★★★
                 ws.onmessage = (event) => {
                     const data = JSON.parse(event.data);
                     console.log('サーバーからメッセージ:', data);
-
-                    // ★ 修正: サーバーからの応答時に、既に次の録音が始まっているかチェック
-                    // もし isRecording == true なら、ユーザーが割り込んだと判断し、
-                    // この（古い）応答は破棄する
-                    if (data.status === 'complete' && isRecording) {
-                        console.log("ユーザーが次の発話を開始しているため、古い応答を破棄します。");
-                        // VADは動き続けており、録音も続行しているので何もしない
-                        return;
-                    }
                     
-                    statusDiv.textContent = data.message; 
+                    // 共通してメッセージがあれば表示
+                    if (data.message) {
+                        statusDiv.textContent = data.message;
+                    }
 
-                    if (data.status === 'complete' && data.audio_url) {
-                        // (isRecording は false のはずなので、) AIの回答を再生
+                    // ★★★ 変更点: ステータスごとの分岐処理を追加 ★★★
+                    
+                    if (data.status === 'processing') {
+                        // 音声送信直後
+                        questionTextDiv.textContent = '(聞き取っています...)';
+                        answerTextDiv.textContent = '';
+                        vad?.pause(); // 処理中はVADを一時停止（自分の独り言を拾わないように）
+
+                    } else if (data.status === 'transcribed') {
+                        // 1. 文字起こし完了 -> 即表示
+                        questionTextDiv.textContent = data.question_text;
+                        answerTextDiv.textContent = '(回答を生成しています...)';
+
+                    } else if (data.status === 'answered') {
+                        // 2. 回答生成完了 -> 即表示
+                        answerTextDiv.textContent = data.answer_text;
+                        // 音声合成待ちであることを表示
+                        // statusDivは上の共通処理で更新済み
+
+                    } else if (data.status === 'complete' && data.audio_url) {
+                        // 3. 音声合成完了 -> 再生開始
+                        // 念のためテキストも上書き（内容は同じはず）
+                        if(data.question_text) questionTextDiv.textContent = data.question_text;
+                        if(data.answer_text) answerTextDiv.textContent = data.answer_text;
+                        
                         playAudio(data.audio_url); 
-                        questionTextDiv.textContent = data.question_text || '（質問を聞き取れませんでした）';
-                        answerTextDiv.textContent = data.answer_text || '（回答を生成できませんでした）';
                         createDownloadLink(data.audio_url);
                         
                     } else if (data.status === 'error') {
                         answerTextDiv.textContent = `エラー: ${data.message}`;
-                        // ★ 修正: VADは停止していないので、start()は不要。ステータスを戻す
-                        if (!isRecording && !isSpeaking) { // ユーザーが話していない時だけ
-                            statusDiv.textContent = 'エラーが発生しました。待機中に戻ります。';
-                            vadStatusDiv.textContent = '待機中...';
-                        }
+                        statusDiv.textContent = 'エラーが発生しました。待機中に戻ります。';
+                        // エラー時はVADを再開させる
+                        isAISpeaking = false;
+                        vad?.start();
                     }
                 };
 
@@ -314,17 +351,18 @@ async def get_root():
 
                     vad = await window.vad.MicVAD.new({
                         stream: mediaStream, 
-                        
                         onnxWASMBasePath: "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/",
                         baseAssetPath: "https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.29/dist/",
                         
                         onSpeechStart: () => {
+                            if (isAISpeaking) return; // AI再生中は無視
                             isSpeaking = true;
                             vadStatusDiv.textContent = "発話中...";
                             if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
                             if (!isRecording) startMediaRecorder(); 
                         },
                         onSpeechEnd: (audio) => {
+                            if (isAISpeaking) return;
                             isSpeaking = false;
                             vadStatusDiv.textContent = "発話終了 (無音タイマー起動)";
                             if (isRecording) startSilenceTimer(); 
@@ -344,8 +382,7 @@ async def get_root():
                 }
             }
 
-            
-            // --- 3. MediaRecorder (録音機能) のセットアップ ---
+            // --- 3. MediaRecorder のセットアップ ---
             function setupMediaRecorder(stream) {
                 mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' });
                 
@@ -355,15 +392,14 @@ async def get_root():
                     }
                 };
 
-                // ★★★ 修正箇所 2: onstop 処理 ★★★
                 mediaRecorder.onstop = () => {
                     console.log("MediaRecorder: 録音停止。");
                     isRecording = false;
 
                     if (audioChunks.length === 0) {
-                        console.log("録音データが空です。送信をスキップします。");
-                        // ★ 修正: VADは停止していないので、start()を削除
-                        // if (!isAISpeaking) vad?.start(); 
+                        console.log("録音データが空です。");
+                        // AI再生中でなければVAD再開
+                        if (!isAISpeaking && vad) vad.start(); 
                         return;
                     }
 
@@ -372,8 +408,10 @@ async def get_root():
 
                     if (ws && ws.readyState === WebSocket.OPEN) {
                         ws.send(audioBlob);
-                        statusDiv.textContent = '音声を送信中... サーバー処理を待っています。';
+                        statusDiv.textContent = '音声を送信中...';
                         vadStatusDiv.textContent = 'サーバー処理中...';
+                        // ここでVADを止めて、サーバーからのレスポンスを待つ
+                        vad?.pause(); 
                     } else {
                         statusDiv.textContent = 'サーバーに接続されていません。';
                     }
@@ -383,63 +421,45 @@ async def get_root():
                     console.log("MediaRecorder: 録音開始。");
                     isRecording = true;
                     audioChunks = []; 
-                    clearResults(); 
+                    // 画面クリアはまだしない（前の会話を残したい場合はここを調整）
+                    // clearResults(); 
                 };
             }
             
-            // --- 4. 録音の開始/停止制御 ---
-            
+            // --- 4. 録音制御 ---
             function startMediaRecorder() {
                 if (mediaRecorder && !isRecording) {
-                    // (前回の修正: AI再生中のガードは削除済み)
-                    
-                    // もしAIが喋っている最中に録音を開始したら、AIの再生を停止する
-                    const aiAudio = audioPlayback.querySelector('audio');
-                    if (aiAudio && !aiAudio.paused) {
-                        aiAudio.pause();
-                        aiAudio.currentTime = 0; 
-                        console.log("AIの再生を中断しました。");
-                        isAISpeaking = false; 
-                    }
-
+                    if (isAISpeaking) return;
                     mediaRecorder.start(1000); 
                 }
             }
             
-            // ★★★ 修正箇所 3: stopMediaRecorder ★★★
             function stopMediaRecorder() {
                 if (mediaRecorder && isRecording) {
                     mediaRecorder.stop();
-                    // ★ 修正: サーバー応答を待つためのVAD一時停止を削除
-                    // これでサーバー処理中もVADが動き続ける
-                    // vad?.pause(); 
                 }
             }
 
             // --- 5. 無音タイマー ---
             function startSilenceTimer() {
-                if (silenceTimer) {
-                    clearTimeout(silenceTimer);
-                }
+                if (silenceTimer) clearTimeout(silenceTimer);
                 silenceTimer = setTimeout(() => {
-                    console.log(`無音時間が ${SILENCE_THRESHOLD_MS}ms に達しました。`);
+                    console.log(`無音判定。録音停止します。`);
                     if (isRecording && !isSpeaking) {
-                        vadStatusDiv.textContent = "無音検出。サーバーへ送信します。";
+                        vadStatusDiv.textContent = "無音検出。送信します。";
                         stopMediaRecorder();
                     }
                     silenceTimer = null;
                 }, SILENCE_THRESHOLD_MS);
             }
 
-            // --- 6. VADの停止 (クリーンアップ) ---
+            // --- 6. VAD停止 ---
             function stopVAD() {
                 vad?.destroy(); 
                 vad = null;
                 mediaStream?.getTracks().forEach(track => track.stop());
                 mediaStream = null;
-                if (mediaRecorder && isRecording) {
-                    mediaRecorder.stop();
-                }
+                if (mediaRecorder && isRecording) mediaRecorder.stop();
                 isRecording = false;
                 
                 startButton.disabled = false;
@@ -448,7 +468,7 @@ async def get_root():
                 vadStatusDiv.textContent = '';
             }
             
-            // --- 7. ユーティリティ関数 ---
+            // --- 7. ユーティリティ ---
             function clearResults() {
                 audioPlayback.innerHTML = '';
                 downloadLinkDiv.innerHTML = '';
@@ -457,8 +477,10 @@ async def get_root():
             }
 
             function playAudio(url) {
-                // (前回の修正: VADのpause/startは削除済み)
+                // ★再生開始時に確実にVADを止める
+                vad?.pause(); 
                 isAISpeaking = true;
+                statusDiv.textContent = '音声回答を再生中...';
                 
                 audioPlayback.innerHTML = '';
                 const audio = new Audio(url);
@@ -466,14 +488,14 @@ async def get_root():
                 audio.autoplay = true;
                 
                 audio.onended = () => {
-                    console.log("AIの再生完了。"); // VADは動き続けている
+                    console.log("AIの再生完了。VADを再開します。");
                     isAISpeaking = false;
                     
-                    // ユーザーが割り込んでいなければ、ステータスを待機中に戻す
-                    if (!isSpeaking) { 
-                        statusDiv.textContent = '待機中... 話しかけてください。';
-                        vadStatusDiv.textContent = '待機中...';
-                    }
+                    // ★再生終了後にユーザー入力を受け付け再開
+                    vad?.start(); 
+                    
+                    statusDiv.textContent = '待機中... 話しかけてください。';
+                    vadStatusDiv.textContent = '待機中...';
                 };
                 
                 audioPlayback.appendChild(audio);
@@ -488,11 +510,10 @@ async def get_root():
                 downloadLinkDiv.appendChild(a);
             }
 
-            // --- 8. イベントリスナー ---
+            // --- 8. イベント ---
             startButton.onclick = setupVAD;
             stopButton.onclick = stopVAD;
 
-            // ページ読み込み時にWebSocket接続を開始
             window.onload = () => {
                 startButton.disabled = true;
                 connectWebSocket();
@@ -502,7 +523,6 @@ async def get_root():
     </body>
     </html>
     """
-                    
 
 # ---------------------------
 # サーバー起動

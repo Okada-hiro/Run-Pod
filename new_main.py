@@ -430,7 +430,7 @@ async def get_root():
             function startMediaRecorder() {
                 if (mediaRecorder && !isRecording) {
                     if (isAISpeaking) return;
-                    mediaRecorder.start(1000); 
+                    mediaRecorder.start(); 
                 }
             }
             

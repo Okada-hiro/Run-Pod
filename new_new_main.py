@@ -99,33 +99,38 @@ async def process_audio_file(audio_path: str, original_filename: str, websocket:
         )
         
         if success_tts:
-            logger.info(f"[TASK] (4/4) 音声合成 完了。クライアントにバイナリデータを送信します。")
+            # ★ ログ確認: WAVだと880KBもある。これをMP3にして軽量化する。
+            logger.info(f"[TASK] (4/4) 音声合成 完了。MP3に変換して送信します。")
             
             try:
-                # 1. メタデータ（テキスト情報など）を先にJSONで送る
+                # --- 追加・変更部分 START ---
+                # WAVファイルを読み込み、メモリ上でMP3に変換
+                audio_segment = AudioSegment.from_wav(answer_wav_path_abs)
+                
+                mp3_buffer = io.BytesIO()
+                # bitrate="128k" 程度で十分高音質かつ軽量
+                audio_segment.export(mp3_buffer, format="mp3", bitrate="128k")
+                audio_data = mp3_buffer.getvalue()
+                # --- 追加・変更部分 END ---
+
+                # メタデータ送信
                 await websocket.send_json({
                     "status": "complete",
                     "message": "再生を開始します。",
                     "question_text": question_text, 
                     "answer_text": answer_text,
-                    "mode": "binary_audio_next" # クライアントに「次は音声だよ」と伝える目印（なくても判定可能だが親切）
+                    "mode": "binary_audio_next"
                 })
 
-                # 2. 音声データをバイナリ(Bytes)として直接送る
-                # ★ ここでBase64エンコードをせず、生データを送ることでサーバー負荷もクライアント負荷も下がる
-                with open(answer_wav_path_abs, "rb") as audio_file:
-                    audio_data = audio_file.read()
-                    await websocket.send_bytes(audio_data)
+                # バイナリデータ送信 (MP3データ)
+                await websocket.send_bytes(audio_data)
                 
-                logger.info(f"[TASK] バイナリ音声データ送信完了 ({len(audio_data)} bytes)")
+                # サイズ比較のログを出しておくと効果がわかります
+                logger.info(f"[TASK] 音声データ送信完了 (MP3サイズ: {len(audio_data)} bytes)")
 
-            except FileNotFoundError:
-                 logger.error(f"[TASK ERROR] 生成した音声ファイルが見つかりません: {answer_wav_path_abs}")
-                 await websocket.send_json({"status": "error", "message": "音声ファイルの読み込みに失敗しました。"})
-
-            except FileNotFoundError:
-                 logger.error(f"[TASK ERROR] 生成した音声ファイルが見つかりません: {answer_wav_path_abs}")
-                 await websocket.send_json({"status": "error", "message": "音声ファイルの読み込みに失敗しました。"})
+            except Exception as e: # FileNotFoundError以外もキャッチするように変更
+                 logger.error(f"[TASK ERROR] 音声変換・送信中にエラー: {e}", exc_info=True)
+                 await websocket.send_json({"status": "error", "message": "音声データの送信に失敗しました。"})
 
         else:
             logger.warning(f"[WARN] (4/4) 音声合成に失敗しました。")

@@ -7,12 +7,10 @@ from fastapi.websockets import WebSocketDisconnect
 import os
 import asyncio
 import time
-import subprocess 
 import logging 
 import sys 
 from pydub import AudioSegment
 import io
-import base64
 import re # ストリーミングの文切り出しに必要
 
 # --- ロギング設定 ---
@@ -26,7 +24,7 @@ logger = logging.getLogger(__name__)
 # --- 既存の処理モジュールをインポート ---
 try:
     from transcribe_func import whisper_text_only
-    # ★ ストリーミング関数(generate_answer_stream)をインポートに追加
+    # ★ ストリーミング関数(generate_answer_stream)をインポート
     from new_answer_generator import generate_answer, generate_answer_stream
     from new_text_to_speech import synthesize_speech
 except ImportError:
@@ -35,95 +33,33 @@ except ImportError:
 
 # --- 設定 ---
 PROCESSING_DIR = "incoming_audio" 
-MODEL_SIZE = "medium"
 LANGUAGE = "ja"
 
 # --- アプリケーション初期化 ---
 app = FastAPI()
 os.makedirs(PROCESSING_DIR, exist_ok=True)
 app.mount(f"/download", StaticFiles(directory=PROCESSING_DIR), name="download")
-logger.info(f"'{PROCESSING_DIR}' ディレクトリを /download としてマウントしました。")
 
 
 # ---------------------------
-# バックグラウンド処理関数 (ストリーミング対応版)
+# 1. 文ごとの処理関数 (字幕送信 -> 音声合成 -> 音声送信)
 # ---------------------------
-async def process_audio_file(audio_path: str, original_filename: str, websocket: WebSocket):
-    logger.info(f"[TASK START] ファイル処理開始: {original_filename}")
-    
-    try:
-        # --- 1. 文字起こし ---
-        output_txt_path = os.path.join(PROCESSING_DIR, original_filename + ".txt")
-        logger.info(f"[TASK] (1/4) 文字起こし中...")
-        
-        # Whisper実行
-        question_text = await asyncio.to_thread(
-            whisper_text_only,
-            audio_path, language=LANGUAGE, output_txt=output_txt_path
-        )
-        logger.info(f"[TASK] (1/4) 文字起こし完了: {question_text}")
-
-        # クライアントに通知
-        await websocket.send_json({
-            "status": "transcribed",
-            "message": "回答を生成しながら話します...",
-            "question_text": question_text
-        })
-
-        # --- 2. ストリーミング回答生成 & 音声合成パイプライン ---
-        logger.info(f"[TASK] ストリーミング処理開始...")
-
-        text_buffer = ""
-        sentence_count = 0
-        full_answer_log = ""
-        
-        # 句読点などで分割する正規表現（読点「、」は切らない）
-        split_pattern = r'(?<=[。！？\n])'
-
-        # ジェネレータからテキストを少しずつ取得
-        iterator = generate_answer_stream(question_text)
-
-        for chunk_text in iterator:
-            text_buffer += chunk_text
-            full_answer_log += chunk_text 
-
-            # バッファ内に句読点があるかチェックして分割
-            sentences = re.split(split_pattern, text_buffer)
-
-            # 文として確定している部分（最後以外）を処理
-            if len(sentences) > 1:
-                for sent in sentences[:-1]:
-                    if sent.strip():
-                        sentence_count += 1
-                        await process_sentence(sent, original_filename, sentence_count, websocket)
-                
-                # 未確定の末尾をバッファに戻す
-                text_buffer = sentences[-1]
-
-        # ループ終了後、バッファに残っているテキストがあれば処理
-        if text_buffer.strip():
-            sentence_count += 1
-            await process_sentence(text_buffer, original_filename, sentence_count, websocket)
-        
-        # 全送信完了を通知
-        await websocket.send_json({"status": "complete", "answer_text": full_answer_log})
-        logger.info(f"[TASK END] ストリーミング完了: {original_filename}")
-
-    except Exception as e:
-        logger.error(f"[TASK ERROR] '{original_filename}' の処理中にエラーが発生しました: {e}", exc_info=True)
-        try:
-            await websocket.send_json({"status": "error", "message": f"処理中にエラーが発生しました: {e}"})
-        except WebSocketDisconnect:
-            pass 
-
-# ヘルパー関数: 1文を音声化して送信
 async def process_sentence(text: str, base_filename: str, index: int, websocket: WebSocket):
     logger.info(f"[STREAM] 文{index}: {text[:20]}...")
     
+    # (A) 先に字幕テキストを送る (ブラウザで表示させる)
+    try:
+        await websocket.send_json({
+            "status": "reply_chunk",
+            "text_chunk": text
+        })
+    except Exception as e:
+        logger.error(f"[STREAM ERROR] テキスト送信失敗: {e}")
+
+    # (B) 音声合成
     part_filename = f"{base_filename}.part{index}.wav"
     part_path_abs = os.path.abspath(os.path.join(PROCESSING_DIR, part_filename))
 
-    # 音声合成
     success = await asyncio.to_thread(
         synthesize_speech,
         text_to_speak=text,
@@ -132,19 +68,89 @@ async def process_sentence(text: str, base_filename: str, index: int, websocket:
     
     if success:
         try:
-            # WAV -> MP3 変換 (軽量化のため)
+            # (C) WAV -> MP3 変換 (軽量化)
             audio_segment = AudioSegment.from_wav(part_path_abs)
             mp3_buffer = io.BytesIO()
             audio_segment.export(mp3_buffer, format="mp3", bitrate="128k")
             audio_data = mp3_buffer.getvalue()
 
-            # バイナリ送信
+            # (D) バイナリ音声送信
             await websocket.send_bytes(audio_data)
         except Exception as e:
             logger.error(f"[STREAM ERROR] 音声変換・送信中にエラー: {e}", exc_info=True)
 
+
 # ---------------------------
-# WebSocket エンドポイント ( /ws )
+# 2. バックグラウンド処理 (メインフロー)
+# ---------------------------
+async def process_audio_file(audio_path: str, original_filename: str, websocket: WebSocket):
+    logger.info(f"[TASK START] ファイル処理開始: {original_filename}")
+    
+    try:
+        # --- 文字起こし ---
+        output_txt_path = os.path.join(PROCESSING_DIR, original_filename + ".txt")
+        logger.info(f"[TASK] (1/4) 文字起こし中...")
+        
+        question_text = await asyncio.to_thread(
+            whisper_text_only,
+            audio_path, language=LANGUAGE, output_txt=output_txt_path
+        )
+        logger.info(f"[TASK] (1/4) 文字起こし完了: {question_text}")
+
+        await websocket.send_json({
+            "status": "transcribed",
+            "message": "回答を生成しながら話します...",
+            "question_text": question_text
+        })
+
+        # --- ストリーミング回答 & パイプライン処理 ---
+        logger.info(f"[TASK] ストリーミング処理開始...")
+
+        text_buffer = ""
+        sentence_count = 0
+        full_answer_log = ""
+        
+        # 句読点(。！？)または改行で分割する正規表現
+        split_pattern = r'(?<=[。！？\n])'
+
+        # LLMからストリーミングで文字を受け取る
+        iterator = generate_answer_stream(question_text)
+
+        for chunk_text in iterator:
+            text_buffer += chunk_text
+            full_answer_log += chunk_text 
+
+            # バッファ分割チェック
+            sentences = re.split(split_pattern, text_buffer)
+
+            if len(sentences) > 1:
+                # 確定した文(最後以外)を処理
+                for sent in sentences[:-1]:
+                    if sent.strip():
+                        sentence_count += 1
+                        await process_sentence(sent, original_filename, sentence_count, websocket)
+                
+                # 残りをバッファに戻す
+                text_buffer = sentences[-1]
+
+        # ループ終了後の残りかす処理
+        if text_buffer.strip():
+            sentence_count += 1
+            await process_sentence(text_buffer, original_filename, sentence_count, websocket)
+        
+        # 完了通知
+        await websocket.send_json({"status": "complete", "answer_text": full_answer_log})
+        logger.info(f"[TASK END] ストリーミング完了: {original_filename}")
+
+    except Exception as e:
+        logger.error(f"[TASK ERROR] エラー: {e}", exc_info=True)
+        try:
+            await websocket.send_json({"status": "error", "message": f"エラー: {e}"})
+        except WebSocketDisconnect:
+            pass 
+
+# ---------------------------
+# 3. WebSocket エンドポイント
 # ---------------------------
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -158,10 +164,8 @@ async def websocket_endpoint(websocket: WebSocket):
             temp_id = f"ws_{int(time.time())}"
             output_wav_filename = f"{temp_id}.wav"
             output_wav_path = os.path.join(PROCESSING_DIR, output_wav_filename)
-
-            logger.info(f"[WS] メモリ内で変換処理開始...")
             
-            # ★修正点: format指定を外して自動判別させる(WebMもWAVもOKにする)
+            # pydubでフォーマット自動判別してWAV化
             def convert_audio():
                 try:
                     audio = AudioSegment.from_file(audio_io) 
@@ -175,8 +179,6 @@ async def websocket_endpoint(websocket: WebSocket):
             if not await asyncio.to_thread(convert_audio):
                 await websocket.send_json({"status": "error", "message": "音声形式の変換に失敗しました。"})
                 continue
-            
-            logger.info(f"[WS] 変換成功: {output_wav_path}")
             
             # 処理開始通知
             await websocket.send_json({"status": "processing", "message": "音声を認識しています..."})
@@ -199,7 +201,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
 
 # ---------------------------
-# ルート ( / )
+# 4. フロントエンド (HTML/JS)
 # ---------------------------
 @app.get("/", response_class=HTMLResponse)
 async def get_root():
@@ -209,7 +211,7 @@ async def get_root():
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device.width, initial-scale=1.0">
-        <title>VAD音声応答 (Streaming)</title>
+        <title>AI Voice Talk (Streaming)</title>
         
         <style>
             body { font-family: sans-serif; display: grid; place-items: center; min-height: 90vh; background: #f4f4f4; }
@@ -236,13 +238,11 @@ async def get_root():
             #answer-text::before { content: '■ AIの回答:'; font-weight: bold; display: block; margin-bottom: 0.3rem; color: #28a745;}
             
             #audioPlayback { margin-top: 1rem; }
-            #audioPlayback audio { width: 100%; }
-            #downloadLink { margin-top: 0.5rem; font-size: 0.9rem; }
         </style>
     </head>
     <body>
         <div id="container">
-            <h1>音声応答システム (Fast)</h1>
+            <h1>AI Voice Talk</h1>
             <p>下のボタンを押してマイクを起動してください。</p>
             
             <div>
@@ -250,10 +250,10 @@ async def get_root():
                 <button id="stopButton" disabled>マイクを停止する</button>
             </div>
             <div>
-                <button id="interruptButton" disabled>■ 回答を中断して話す</button>
+                <button id="interruptButton" disabled>■ 話をさえぎる</button>
             </div>
             
-            <div id="status">ここにステータスが表示されます</div>
+            <div id="status">準備完了</div>
             <div id="vad-status">(VAD待機中)</div>
             
             <div id="qa-display">
@@ -262,7 +262,6 @@ async def get_root():
             </div>
 
             <div id="audioPlayback"></div>
-            <div id="downloadLink"></div>
         </div>
 
         <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.wasm.min.js"></script>
@@ -273,11 +272,9 @@ async def get_root():
             const startButton = document.getElementById('startButton');
             const stopButton = document.getElementById('stopButton');
             const interruptButton = document.getElementById('interruptButton'); 
-            
             const statusDiv = document.getElementById('status');
             const vadStatusDiv = document.getElementById('vad-status');
             const audioPlayback = document.getElementById('audioPlayback');
-            const downloadLinkDiv = document.getElementById('downloadLink');
             const questionTextDiv = document.getElementById('question-text');
             const answerTextDiv = document.getElementById('answer-text');
 
@@ -311,11 +308,13 @@ async def get_root():
 
                 ws.onmessage = (event) => {
                     if (event.data instanceof ArrayBuffer) {
+                        // 音声受信 -> キューに入れる
                         console.log(`音声受信: ${event.data.byteLength} bytes`);
                         const audioBlob = new Blob([event.data], { type: 'audio/mp3' });
                         audioQueue.push(audioBlob);
                         processAudioQueue();
                     } else {
+                        // JSON受信
                         try {
                             const data = JSON.parse(event.data);
                             handleJsonMessage(data);
@@ -326,17 +325,17 @@ async def get_root():
                 };
 
                 ws.onclose = () => {
-                    console.log('WebSocket 接続切断');
-                    statusDiv.textContent = 'サーバーとの接続が切れました。リロードしてください。';
+                    statusDiv.textContent = 'サーバー切断。リロードしてください。';
                     stopVAD(); 
                 };
             }
 
-            // --- 2. メッセージ処理 ---
+            // --- 2. JSONメッセージ処理 ---
             function handleJsonMessage(data) {
                 if (data.message) statusDiv.textContent = data.message;
 
                 if (data.status === 'processing') {
+                    // 新しいターン開始
                     questionTextDiv.textContent = '(聞き取っています...)';
                     answerTextDiv.textContent = '';
                     audioQueue = [];     
@@ -346,23 +345,27 @@ async def get_root():
 
                 } else if (data.status === 'transcribed') {
                     questionTextDiv.textContent = data.question_text;
-                    answerTextDiv.textContent = '(回答生成中...)';
+                    answerTextDiv.textContent = '...'; // 待機中
+
+                } else if (data.status === 'reply_chunk') {
+                    // ★ 字幕の追記処理
+                    if (answerTextDiv.textContent === '...') {
+                        answerTextDiv.textContent = '';
+                    }
+                    answerTextDiv.textContent += data.text_chunk;
 
                 } else if (data.status === 'answered') {
                     answerTextDiv.textContent = data.answer_text;
 
                 } else if (data.status === 'complete') {
-                    console.log("サーバー処理完了通知を受信");
+                    console.log("サーバー生成完了");
                     isServerDone = true;
-                    if(data.answer_text) answerTextDiv.textContent = data.answer_text;
-                    
                     if (!isPlaying && audioQueue.length === 0) {
                         finishPlayback();
                     }
                     
                 } else if (data.status === 'error') {
                     answerTextDiv.textContent = `エラー: ${data.message}`;
-                    statusDiv.textContent = 'エラーが発生しました。待機中に戻ります。';
                     finishPlayback(); 
                 }
             }
@@ -370,9 +373,7 @@ async def get_root():
             // --- 3. VADセットアップ ---
             async function setupVAD() {
                 try {
-                    while (!window.vad) {
-                        await new Promise(r => setTimeout(r, 50));
-                    }
+                    while (!window.vad) await new Promise(r => setTimeout(r, 50));
                     mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
                     
                     vad = await window.vad.MicVAD.new({
@@ -380,14 +381,12 @@ async def get_root():
                         onnxWASMBasePath: "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/",
                         baseAssetPath: "https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.29/dist/",
                         
-                        // ★ 感度調整
+                        // 調整パラメータ
                         positiveSpeechThreshold: 0.8,
                         negativeSpeechThreshold: 0.8,
                         minSpeechFrames: 2,
-
-                        // ★★★ 最重要設定 ★★★
-                        preSpeechPadFrames: 20,       // 声と判定される「前」の20フレーム(約0.6秒)も含める
-                        redemptionFrames: 30,         // 無音になってから1秒弱待ってから送信
+                        preSpeechPadFrames: 20,  // ★冒頭切れ対策(約0.6秒バッファ)
+                        redemptionFrames: 30,    // 文末判定の猶予
                         
                         onSpeechStart: () => {
                             if (isAISpeaking) return; 
@@ -398,10 +397,10 @@ async def get_root():
                         onSpeechEnd: (audio) => {
                             if (isAISpeaking) return;
                             isSpeaking = false;
-                            vadStatusDiv.textContent = "発話終了。送信します...";
+                            vadStatusDiv.textContent = "送信中...";
                             
                             if (ws && ws.readyState === WebSocket.OPEN) {
-                                sendAudioAsWav(audio);
+                                sendAudioAsWav(audio); // Float32 -> WAV変換して送信
                                 statusDiv.textContent = '音声を送信中...';
                                 vad?.pause(); 
                             }
@@ -416,25 +415,21 @@ async def get_root():
                     vadStatusDiv.textContent = '待機中...';
 
                 } catch (err) {
-                    console.error('VAD設定エラー:', err);
-                    statusDiv.textContent = 'VADの初期化に失敗しました。';
+                    console.error('VADエラー:', err);
+                    statusDiv.textContent = 'VAD初期化失敗';
                 }
             }
 
-            // --- 4. ヘルパー: Float32ArrayをWAVに変換して送信 ---
+            // --- 4. WAV変換ヘルパー (ブラウザ側でエンコード) ---
             function sendAudioAsWav(float32Array) {
-                // 16kHzにリサンプリングしたいが、ブラウザの実装依存を避けるため
-                // VADの生データをそのまま送り、サーバー側で変換する
                 const wavBuffer = encodeWAV(float32Array, 16000); 
                 const blob = new Blob([wavBuffer], { type: 'audio/wav' });
                 ws.send(blob);
             }
 
-            // 簡易WAVエンコーダー
             function encodeWAV(samples, sampleRate) {
                 const buffer = new ArrayBuffer(44 + samples.length * 2);
                 const view = new DataView(buffer);
-
                 writeString(view, 0, 'RIFF');
                 view.setUint32(4, 36 + samples.length * 2, true);
                 writeString(view, 8, 'WAVE');
@@ -449,7 +444,6 @@ async def get_root():
                 writeString(view, 36, 'data');
                 view.setUint32(40, samples.length * 2, true);
                 floatTo16BitPCM(view, 44, samples);
-
                 return view;
             }
 
@@ -467,20 +461,18 @@ async def get_root():
                 }
             }
 
-            // --- 5. VAD停止 ---
+            // --- 5. 制御系関数 ---
             function stopVAD() {
                 vad?.destroy(); 
                 vad = null;
                 mediaStream?.getTracks().forEach(track => track.stop());
-                mediaStream = null;
                 isSpeaking = false;
                 startButton.disabled = false;
                 stopButton.disabled = true;
                 interruptButton.disabled = true;
-                statusDiv.textContent = 'マイクが停止しました。';
+                statusDiv.textContent = '停止しました。';
             }
             
-            // --- 6. 音声再生制御 ---
             function processAudioQueue() {
                 if (isPlaying) return;
                 if (audioQueue.length === 0) {
@@ -495,7 +487,7 @@ async def get_root():
                 isPlaying = true;
                 isAISpeaking = true;
                 vad?.pause();
-                statusDiv.textContent = '音声回答を再生中...';
+                statusDiv.textContent = 'AI回答中...';
                 interruptButton.disabled = false;
 
                 if (currentAudioUrl) URL.revokeObjectURL(currentAudioUrl);
@@ -516,18 +508,18 @@ async def get_root():
                     isPlaying = false;
                     processAudioQueue();
                 };
-
+                
                 currentAudio.onerror = (e) => {
                     console.error("再生エラー", e);
                     isPlaying = false;
                     processAudioQueue();
-                };
+                }
 
                 audioPlayback.appendChild(currentAudio);
             }
 
             function finishPlayback() {
-                console.log("全再生完了。待機状態に戻ります。");
+                console.log("全完了。待機モードへ");
                 isAISpeaking = false;
                 isPlaying = false;
                 isServerDone = false;
@@ -545,11 +537,11 @@ async def get_root():
             }
 
             function interruptAudio() {
-                console.log("ユーザー操作により再生を中断します。");
+                console.log("中断");
                 audioQueue = []; 
                 isServerDone = true; 
                 finishPlayback();
-                statusDiv.textContent = '中断しました。どうぞお話しください。';
+                statusDiv.textContent = '中断しました。';
             }
 
             // --- イベント ---
@@ -566,9 +558,6 @@ async def get_root():
     </html>
     """
 
-# ---------------------------
-# サーバー起動
-# ---------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     logger.info(f"サーバーを http://0.0.0.0:{port} で起動します。")

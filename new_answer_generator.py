@@ -36,7 +36,7 @@ def generate_answer(question: str, model="gemini-2.5-flash-lite") -> str:
         return "質問を聞き取れませんでした。"
 
     answer = ""
-    system_prompt = "あなたは丁寧かつ簡潔に質問に答えるアシスタントです。あなたの回答は音声として読み上げられるので、マークダウンではなく、文章を出力してください。"
+    system_prompt = "あなたは丁寧かつ簡潔に質問に答えるアシスタントです。あなたの回答は音声として読み上げられるので、マークダウンではなく、特殊な記号を含まない100文字以内の文章を出力してください。"
 
     try:
         
@@ -68,6 +68,39 @@ def generate_answer(question: str, model="gemini-2.5-flash-lite") -> str:
 
     return answer
 
+def generate_answer_stream(question: str, model="gemini-2.5-flash-lite"):
+    """
+    回答をストリーミング(ジェネレータ)として返す
+    """
+    print(f"[DEBUG] 回答ストリーミング生成開始... (モデル: {model})")
+    
+    if not question:
+        yield "質問を聞き取れませんでした。"
+        return
+
+    system_prompt = "あなたは丁寧に質問に答えるアシスタントです。"
+
+    try:
+        if model.startswith("gemini-"):
+            if not GOOGLE_API_KEY:
+                raise ValueError("GOOGLE_API_KEY が設定されていません")
+            
+            model_instance = genai.GenerativeModel(
+                model_name=model,
+                system_instruction=system_prompt
+            )
+            # ★ stream=True に設定
+            response = model_instance.generate_content(question, stream=True)
+            
+            for chunk in response:
+                if chunk.text:
+                    yield chunk.text
+        else:
+            yield f"対応していないモデル名です: {model}"
+
+    except Exception as e:
+        print(f"[ERROR] ストリーミング生成エラー: {e}")
+        yield "申し訳ありません、エラーが発生しました。"
 # --- 3. 単体テスト (全モデルをテスト) ---
 if __name__ == "__main__":
     print("--- マルチAPI回答生成 単体テスト ---")

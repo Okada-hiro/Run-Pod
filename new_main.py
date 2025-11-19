@@ -12,8 +12,8 @@ import logging
 import sys 
 from pydub import AudioSegment
 import io
-import base64 # ★ Base64エンコードのために追加
-import re
+import base64
+import re # ストリーミングの文切り出しに必要
 
 # --- ロギング設定 ---
 logging.basicConfig(
@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 # --- 既存の処理モジュールをインポート ---
 try:
     from transcribe_func import whisper_text_only
+    # ★ ストリーミング関数(generate_answer_stream)をインポートに追加
     from new_answer_generator import generate_answer, generate_answer_stream
     from new_text_to_speech import synthesize_speech
 except ImportError:
@@ -40,42 +41,43 @@ LANGUAGE = "ja"
 # --- アプリケーション初期化 ---
 app = FastAPI()
 os.makedirs(PROCESSING_DIR, exist_ok=True)
-# /download マウントは残しておいても良い (デバッグ用)
 app.mount(f"/download", StaticFiles(directory=PROCESSING_DIR), name="download")
 logger.info(f"'{PROCESSING_DIR}' ディレクトリを /download としてマウントしました。")
 
 
 # ---------------------------
-# バックグラウンド処理関数 
+# バックグラウンド処理関数 (ストリーミング対応版)
 # ---------------------------
 async def process_audio_file(audio_path: str, original_filename: str, websocket: WebSocket):
     logger.info(f"[TASK START] ファイル処理開始: {original_filename}")
     
     try:
-        # --- 1. 文字起こし (ここは同じ) ---
+        # --- 1. 文字起こし ---
         output_txt_path = os.path.join(PROCESSING_DIR, original_filename + ".txt")
         logger.info(f"[TASK] (1/4) 文字起こし中...")
+        
+        # Whisper実行
         question_text = await asyncio.to_thread(
-            whisper_text_only, audio_path, language=LANGUAGE, output_txt=output_txt_path
+            whisper_text_only,
+            audio_path, language=LANGUAGE, output_txt=output_txt_path
         )
         logger.info(f"[TASK] (1/4) 文字起こし完了: {question_text}")
 
+        # クライアントに通知
         await websocket.send_json({
             "status": "transcribed",
             "message": "回答を生成しながら話します...",
             "question_text": question_text
         })
 
-        # --- 2 & 3 & 4. ストリーミング回答・合成・送信 ---
+        # --- 2. ストリーミング回答生成 & 音声合成パイプライン ---
         logger.info(f"[TASK] ストリーミング処理開始...")
 
-        # バッファとカウンターの準備
         text_buffer = ""
         sentence_count = 0
         full_answer_log = ""
-
-        # 正規表現: 読点(、)では切らず、句点(。)や感嘆符(！)、改行で切る
-        # (?<=...) は「後読み」アサーションで、区切り文字を文末に含めるため
+        
+        # 句読点などで分割する正規表現（読点「、」は切らない）
         split_pattern = r'(?<=[。！？\n])'
 
         # ジェネレータからテキストを少しずつ取得
@@ -83,16 +85,15 @@ async def process_audio_file(audio_path: str, original_filename: str, websocket:
 
         for chunk_text in iterator:
             text_buffer += chunk_text
-            full_answer_log += chunk_text # ログ用
+            full_answer_log += chunk_text 
 
             # バッファ内に句読点があるかチェックして分割
             sentences = re.split(split_pattern, text_buffer)
 
-            # sentences の最後以外は「確定した文」なので処理する
-            # (最後の一つはまだ続きがあるかもしれないのでバッファに戻す)
+            # 文として確定している部分（最後以外）を処理
             if len(sentences) > 1:
                 for sent in sentences[:-1]:
-                    if sent.strip(): # 空文字でなければ処理
+                    if sent.strip():
                         sentence_count += 1
                         await process_sentence(sent, original_filename, sentence_count, websocket)
                 
@@ -109,40 +110,38 @@ async def process_audio_file(audio_path: str, original_filename: str, websocket:
         logger.info(f"[TASK END] ストリーミング完了: {original_filename}")
 
     except Exception as e:
-        logger.error(f"[TASK ERROR] エラー: {e}", exc_info=True)
-        await websocket.send_json({"status": "error", "message": f"エラー: {e}"})
+        logger.error(f"[TASK ERROR] '{original_filename}' の処理中にエラーが発生しました: {e}", exc_info=True)
+        try:
+            await websocket.send_json({"status": "error", "message": f"処理中にエラーが発生しました: {e}"})
+        except WebSocketDisconnect:
+            pass 
 
-
-# ★ ヘルパー関数: 1文を音声化して送信する
+# ヘルパー関数: 1文を音声化して送信
 async def process_sentence(text: str, base_filename: str, index: int, websocket: WebSocket):
     logger.info(f"[STREAM] 文{index}: {text[:20]}...")
     
-    # ファイル名: original.wav.part1.wav
     part_filename = f"{base_filename}.part{index}.wav"
     part_path_abs = os.path.abspath(os.path.join(PROCESSING_DIR, part_filename))
 
     # 音声合成
     success = await asyncio.to_thread(
-        synthesize_speech, text_to_speak=text, output_wav_path=part_path_abs
+        synthesize_speech,
+        text_to_speak=text,
+        output_wav_path=part_path_abs
     )
-
+    
     if success:
-        # MP3変換 (pydub)
         try:
+            # WAV -> MP3 変換 (軽量化のため)
             audio_segment = AudioSegment.from_wav(part_path_abs)
             mp3_buffer = io.BytesIO()
             audio_segment.export(mp3_buffer, format="mp3", bitrate="128k")
             audio_data = mp3_buffer.getvalue()
 
-            # 送信 (メタデータなしでバイナリだけ送る運用でもOKだが、
-            # フロント側でテキスト表示したいならJSONも送ると良い。今回はシンプルにバイナリ送信)
+            # バイナリ送信
             await websocket.send_bytes(audio_data)
-            
-            # 生成したWAVは削除しても良いが、デバッグ用に残してもOK
-            # os.remove(part_path_abs) 
-
         except Exception as e:
-            logger.error(f"[STREAM ERROR] MP3変換失敗: {e}")
+            logger.error(f"[STREAM ERROR] 音声変換・送信中にエラー: {e}", exc_info=True)
 
 # ---------------------------
 # WebSocket エンドポイント ( /ws )
@@ -154,8 +153,6 @@ async def websocket_endpoint(websocket: WebSocket):
     try:
         while True:
             audio_data = await websocket.receive_bytes()
-            
-            # メモリ上のデータ(BytesIO)として扱う
             audio_io = io.BytesIO(audio_data)
             
             temp_id = f"ws_{int(time.time())}"
@@ -164,15 +161,10 @@ async def websocket_endpoint(websocket: WebSocket):
 
             logger.info(f"[WS] メモリ内で変換処理開始...")
             
-            # pydubを使ってメモリ上でWebMを読み込み、WAVとしてディスクに保存
+            # ★修正点: format指定を外して自動判別させる(WebMもWAVもOKにする)
             def convert_audio():
                 try:
-                    # ★変更前: format="webm" と指定していた
-                    # audio = AudioSegment.from_file(audio_io, format="webm") 
-                    
-                    # ★変更後: format指定を削除 (自動判別させる)
                     audio = AudioSegment.from_file(audio_io) 
-                    
                     audio = audio.set_frame_rate(16000).set_channels(1)
                     audio.export(output_wav_path, format="wav")
                     return True
@@ -208,7 +200,6 @@ async def websocket_endpoint(websocket: WebSocket):
 
 # ---------------------------
 # ルート ( / )
-# (ブラウザにHTML/JavaScriptを返す)
 # ---------------------------
 @app.get("/", response_class=HTMLResponse)
 async def get_root():
@@ -218,7 +209,7 @@ async def get_root():
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device.width, initial-scale=1.0">
-        <title>VAD音声応答 (Base64)</title>
+        <title>VAD音声応答 (Streaming)</title>
         
         <style>
             body { font-family: sans-serif; display: grid; place-items: center; min-height: 90vh; background: #f4f4f4; }
@@ -251,7 +242,7 @@ async def get_root():
     </head>
     <body>
         <div id="container">
-            <h1>音声応答システム (Base64)</h1>
+            <h1>音声応答システム (Fast)</h1>
             <p>下のボタンを押してマイクを起動してください。</p>
             
             <div>
@@ -277,7 +268,7 @@ async def get_root():
         <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.wasm.min.js"></script>
         <script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.29/dist/bundle.min.js"></script>
 
-       <script>
+        <script>
             // --- DOM要素 ---
             const startButton = document.getElementById('startButton');
             const stopButton = document.getElementById('stopButton');
@@ -376,15 +367,13 @@ async def get_root():
                 }
             }
 
-            // --- 3. VADセットアップ (★ここが重要★) ---
+            // --- 3. VADセットアップ ---
             async function setupVAD() {
                 try {
                     while (!window.vad) {
                         await new Promise(r => setTimeout(r, 50));
                     }
                     mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-                    
-                    // MediaRecorderは廃止し、VADの内部バッファを使います
                     
                     vad = await window.vad.MicVAD.new({
                         stream: mediaStream, 
@@ -394,11 +383,11 @@ async def get_root():
                         // ★ 感度調整
                         positiveSpeechThreshold: 0.8,
                         negativeSpeechThreshold: 0.8,
-                        minSpeechFrames: 2,           // 発話検知を少し早める
+                        minSpeechFrames: 2,
 
                         // ★★★ 最重要設定 ★★★
-                        preSpeechPadFrames: 20,       // 【重要】声と判定される「前」の20フレーム(約0.6秒)も含める
-                        redemptionFrames: 30,         // 無音になってから1秒弱待ってから送信（文の切れ目を待つ）
+                        preSpeechPadFrames: 20,       // 声と判定される「前」の20フレーム(約0.6秒)も含める
+                        redemptionFrames: 30,         // 無音になってから1秒弱待ってから送信
                         
                         onSpeechStart: () => {
                             if (isAISpeaking) return; 
@@ -407,12 +396,10 @@ async def get_root():
                         },
                         
                         onSpeechEnd: (audio) => {
-                            // audio は Float32Array (-1.0〜1.0) で、preSpeechPadFrames 分も含んでいる
                             if (isAISpeaking) return;
                             isSpeaking = false;
                             vadStatusDiv.textContent = "発話終了。送信します...";
                             
-                            // WebSocketが繋がっているならWAVに変換して送信
                             if (ws && ws.readyState === WebSocket.OPEN) {
                                 sendAudioAsWav(audio);
                                 statusDiv.textContent = '音声を送信中...';
@@ -436,40 +423,31 @@ async def get_root():
 
             // --- 4. ヘルパー: Float32ArrayをWAVに変換して送信 ---
             function sendAudioAsWav(float32Array) {
-                // 16kHzにリサンプリングしたいが、ブラウザのAudioContext依存になるため
-                // ここではVADが取得したレート(通常16kHzか44.1kHzか48kHz)のまま送る。
-                // pydub側で16kHzに変換するので問題なし。
-                
-                const wavBuffer = encodeWAV(float32Array, 16000); // VADはデフォルト16kHzで動作することが多いが環境による
+                // 16kHzにリサンプリングしたいが、ブラウザの実装依存を避けるため
+                // VADの生データをそのまま送り、サーバー側で変換する
+                const wavBuffer = encodeWAV(float32Array, 16000); 
                 const blob = new Blob([wavBuffer], { type: 'audio/wav' });
                 ws.send(blob);
             }
 
-            // 簡易WAVエンコーダー (Float32 -> Int16 PCM WAV)
+            // 簡易WAVエンコーダー
             function encodeWAV(samples, sampleRate) {
                 const buffer = new ArrayBuffer(44 + samples.length * 2);
                 const view = new DataView(buffer);
 
-                // RIFF chunk
                 writeString(view, 0, 'RIFF');
                 view.setUint32(4, 36 + samples.length * 2, true);
                 writeString(view, 8, 'WAVE');
-                
-                // fmt sub-chunk
                 writeString(view, 12, 'fmt ');
                 view.setUint32(16, 16, true);
-                view.setUint16(20, 1, true); // PCM
-                view.setUint16(22, 1, true); // Mono
+                view.setUint16(20, 1, true); 
+                view.setUint16(22, 1, true); 
                 view.setUint32(24, sampleRate, true);
                 view.setUint32(28, sampleRate * 2, true);
                 view.setUint16(32, 2, true);
                 view.setUint16(34, 16, true);
-
-                // data sub-chunk
                 writeString(view, 36, 'data');
                 view.setUint32(40, samples.length * 2, true);
-
-                // Write PCM samples
                 floatTo16BitPCM(view, 44, samples);
 
                 return view;
@@ -502,7 +480,7 @@ async def get_root():
                 statusDiv.textContent = 'マイクが停止しました。';
             }
             
-            // --- 6. 音声再生制御 (ストリーミング版と同じ) ---
+            // --- 6. 音声再生制御 ---
             function processAudioQueue() {
                 if (isPlaying) return;
                 if (audioQueue.length === 0) {

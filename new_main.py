@@ -220,7 +220,64 @@ async def get_root():
         <meta name="viewport" content="width=device.width, initial-scale=1.0">
         <title>VAD音声応答 (Base64)</title>
         
-        <script>
+        <style>
+            body { font-family: sans-serif; display: grid; place-items: center; min-height: 90vh; background: #f4f4f4; }
+            #container { background: white; padding: 2rem; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); text-align: center; width: 90%; max-width: 600px; }
+            
+            button {
+                font-size: 1rem; padding: 0.8rem 1.5rem; border: none; 
+                border-radius: 5px; cursor: pointer; margin: 0.5rem; 
+                color: white; transition: opacity 0.2s;
+            }
+            button:disabled { background: #ccc !important; cursor: not-allowed; opacity: 0.6; }
+            
+            #startButton { background: #007bff; font-size: 1.2rem; }
+            #stopButton { background: #6c757d; }
+            #interruptButton { background: #dc3545; display: inline-block; }
+
+            #status { margin-top: 1.5rem; font-size: 1.1rem; color: #333; min-height: 2em; font-weight: bold; }
+            #vad-status { font-size: 0.9rem; color: #666; height: 1.5em; }
+            
+            #qa-display { margin: 1.5rem auto 0 auto; text-align: left; width: 100%; border-top: 1px solid #eee; padding-top: 1rem; }
+            #qa-display div { margin-bottom: 1rem; padding: 0.8rem; background: #f9f9f9; border-radius: 5px; white-space: pre-wrap; word-wrap: break-word; }
+            
+            #question-text::before { content: '■ あなたの質問:'; font-weight: bold; display: block; margin-bottom: 0.3rem; color: #007bff;}
+            #answer-text::before { content: '■ AIの回答:'; font-weight: bold; display: block; margin-bottom: 0.3rem; color: #28a745;}
+            
+            #audioPlayback { margin-top: 1rem; }
+            #audioPlayback audio { width: 100%; }
+            #downloadLink { margin-top: 0.5rem; font-size: 0.9rem; }
+        </style>
+    </head>
+    <body>
+        <div id="container">
+            <h1>音声応答システム (Base64)</h1>
+            <p>下のボタンを押してマイクを起動してください。</p>
+            
+            <div>
+                <button id="startButton">マイクを起動する</button>
+                <button id="stopButton" disabled>マイクを停止する</button>
+            </div>
+            <div>
+                <button id="interruptButton" disabled>■ 回答を中断して話す</button>
+            </div>
+            
+            <div id="status">ここにステータスが表示されます</div>
+            <div id="vad-status">(VAD待機中)</div>
+            
+            <div id="qa-display">
+                <div id="question-text"></div>
+                <div id="answer-text"></div>
+            </div>
+
+            <div id="audioPlayback"></div>
+            <div id="downloadLink"></div>
+        </div>
+
+        <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.wasm.min.js"></script>
+        <script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.29/dist/bundle.min.js"></script>
+
+       <script>
             // --- DOM要素 ---
             const startButton = document.getElementById('startButton');
             const stopButton = document.getElementById('stopButton');

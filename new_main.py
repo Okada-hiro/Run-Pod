@@ -167,7 +167,12 @@ async def websocket_endpoint(websocket: WebSocket):
             # pydubを使ってメモリ上でWebMを読み込み、WAVとしてディスクに保存
             def convert_audio():
                 try:
-                    audio = AudioSegment.from_file(audio_io, format="webm") 
+                    # ★変更前: format="webm" と指定していた
+                    # audio = AudioSegment.from_file(audio_io, format="webm") 
+                    
+                    # ★変更後: format指定を削除 (自動判別させる)
+                    audio = AudioSegment.from_file(audio_io) 
+                    
                     audio = audio.set_frame_rate(16000).set_channels(1)
                     audio.export(output_wav_path, format="wav")
                     return True
@@ -215,63 +220,6 @@ async def get_root():
         <meta name="viewport" content="width=device.width, initial-scale=1.0">
         <title>VAD音声応答 (Base64)</title>
         
-        <style>
-            body { font-family: sans-serif; display: grid; place-items: center; min-height: 90vh; background: #f4f4f4; }
-            #container { background: white; padding: 2rem; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); text-align: center; width: 90%; max-width: 600px; }
-            
-            button {
-                font-size: 1rem; padding: 0.8rem 1.5rem; border: none; 
-                border-radius: 5px; cursor: pointer; margin: 0.5rem; 
-                color: white; transition: opacity 0.2s;
-            }
-            button:disabled { background: #ccc !important; cursor: not-allowed; opacity: 0.6; }
-            
-            #startButton { background: #007bff; font-size: 1.2rem; }
-            #stopButton { background: #6c757d; }
-            #interruptButton { background: #dc3545; display: inline-block; }
-
-            #status { margin-top: 1.5rem; font-size: 1.1rem; color: #333; min-height: 2em; font-weight: bold; }
-            #vad-status { font-size: 0.9rem; color: #666; height: 1.5em; }
-            
-            #qa-display { margin: 1.5rem auto 0 auto; text-align: left; width: 100%; border-top: 1px solid #eee; padding-top: 1rem; }
-            #qa-display div { margin-bottom: 1rem; padding: 0.8rem; background: #f9f9f9; border-radius: 5px; white-space: pre-wrap; word-wrap: break-word; }
-            
-            #question-text::before { content: '■ あなたの質問:'; font-weight: bold; display: block; margin-bottom: 0.3rem; color: #007bff;}
-            #answer-text::before { content: '■ AIの回答:'; font-weight: bold; display: block; margin-bottom: 0.3rem; color: #28a745;}
-            
-            #audioPlayback { margin-top: 1rem; }
-            #audioPlayback audio { width: 100%; }
-            #downloadLink { margin-top: 0.5rem; font-size: 0.9rem; }
-        </style>
-    </head>
-    <body>
-        <div id="container">
-            <h1>音声応答システム (Base64)</h1>
-            <p>下のボタンを押してマイクを起動してください。</p>
-            
-            <div>
-                <button id="startButton">マイクを起動する</button>
-                <button id="stopButton" disabled>マイクを停止する</button>
-            </div>
-            <div>
-                <button id="interruptButton" disabled>■ 回答を中断して話す</button>
-            </div>
-            
-            <div id="status">ここにステータスが表示されます</div>
-            <div id="vad-status">(VAD待機中)</div>
-            
-            <div id="qa-display">
-                <div id="question-text"></div>
-                <div id="answer-text"></div>
-            </div>
-
-            <div id="audioPlayback"></div>
-            <div id="downloadLink"></div>
-        </div>
-
-        <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.wasm.min.js"></script>
-        <script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.29/dist/bundle.min.js"></script>
-
         <script>
             // --- DOM要素 ---
             const startButton = document.getElementById('startButton');
@@ -287,23 +235,17 @@ async def get_root():
 
             // --- グローバル変数 ---
             let ws;
-            let mediaRecorder;
-            let audioChunks = [];
             let vad; 
             let mediaStream; 
-            let silenceTimer = null; 
-            let isRecording = false; 
             let isSpeaking = false; 
             let isAISpeaking = false; 
             
-            // ★ 追加: ストリーミング再生制御用
-            let audioQueue = [];       // 音声データの順番待ち行列
-            let isPlaying = false;     // 現在再生中かどうか
-            let isServerDone = false;  // サーバーが全ての音声を送り終わったか
-            let currentAudio = null;   // 現在再生中のAudioオブジェクト
+            // ストリーミング再生制御用
+            let audioQueue = [];       
+            let isPlaying = false;     
+            let isServerDone = false;  
+            let currentAudio = null;   
             let currentAudioUrl = null; 
-
-            const SILENCE_THRESHOLD_MS = 200; 
 
             // --- 1. WebSocket接続 ---
             function connectWebSocket() {
@@ -319,16 +261,13 @@ async def get_root():
                     startButton.disabled = false;
                 };
 
-                // ★★★ 修正: 受信処理 ★★★
                 ws.onmessage = (event) => {
                     if (event.data instanceof ArrayBuffer) {
-                        // 音声バイナリ受信 -> キューに追加して処理開始
                         console.log(`音声受信: ${event.data.byteLength} bytes`);
                         const audioBlob = new Blob([event.data], { type: 'audio/mp3' });
                         audioQueue.push(audioBlob);
                         processAudioQueue();
                     } else {
-                        // JSONメッセージ受信
                         try {
                             const data = JSON.parse(event.data);
                             handleJsonMessage(data);
@@ -345,16 +284,15 @@ async def get_root():
                 };
             }
 
-            // ★★★ 修正: JSONメッセージ処理 ★★★
+            // --- 2. メッセージ処理 ---
             function handleJsonMessage(data) {
                 if (data.message) statusDiv.textContent = data.message;
 
                 if (data.status === 'processing') {
-                    // 新しいターンが始まったのでフラグをリセット
                     questionTextDiv.textContent = '(聞き取っています...)';
                     answerTextDiv.textContent = '';
-                    audioQueue = [];     // キューを空に
-                    isServerDone = false; // 完了フラグを下ろす
+                    audioQueue = [];     
+                    isServerDone = false; 
                     isPlaying = false;
                     vad?.pause(); 
 
@@ -363,17 +301,13 @@ async def get_root():
                     answerTextDiv.textContent = '(回答生成中...)';
 
                 } else if (data.status === 'answered') {
-                    // 通常回答（ストリーミングを使わない場合など）
                     answerTextDiv.textContent = data.answer_text;
 
                 } else if (data.status === 'complete') {
-                    // ★ 重要: サーバーからの全送信完了通知
                     console.log("サーバー処理完了通知を受信");
                     isServerDone = true;
-                    // メッセージ更新
                     if(data.answer_text) answerTextDiv.textContent = data.answer_text;
                     
-                    // もし再生中でなく、キューも空なら、ここで終了処理
                     if (!isPlaying && audioQueue.length === 0) {
                         finishPlayback();
                     }
@@ -381,40 +315,52 @@ async def get_root():
                 } else if (data.status === 'error') {
                     answerTextDiv.textContent = `エラー: ${data.message}`;
                     statusDiv.textContent = 'エラーが発生しました。待機中に戻ります。';
-                    finishPlayback(); // 強制終了
+                    finishPlayback(); 
                 }
             }
 
-            // --- 2. VADとマイクのセットアップ (変更なし) ---
+            // --- 3. VADセットアップ (★ここが重要★) ---
             async function setupVAD() {
                 try {
                     while (!window.vad) {
                         await new Promise(r => setTimeout(r, 50));
                     }
                     mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-                    setupMediaRecorder(mediaStream);
-
+                    
+                    // MediaRecorderは廃止し、VADの内部バッファを使います
+                    
                     vad = await window.vad.MicVAD.new({
                         stream: mediaStream, 
                         onnxWASMBasePath: "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/",
                         baseAssetPath: "https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.29/dist/",
+                        
+                        // ★ 感度調整
                         positiveSpeechThreshold: 0.8,
                         negativeSpeechThreshold: 0.8,
-                        redemptionFrames: 3,
-                        minSpeechFrames: 4,
+                        minSpeechFrames: 2,           // 発話検知を少し早める
+
+                        // ★★★ 最重要設定 ★★★
+                        preSpeechPadFrames: 20,       // 【重要】声と判定される「前」の20フレーム(約0.6秒)も含める
+                        redemptionFrames: 30,         // 無音になってから1秒弱待ってから送信（文の切れ目を待つ）
                         
                         onSpeechStart: () => {
                             if (isAISpeaking) return; 
                             isSpeaking = true;
                             vadStatusDiv.textContent = "発話中...";
-                            if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
-                            if (!isRecording) startMediaRecorder(); 
                         },
+                        
                         onSpeechEnd: (audio) => {
+                            // audio は Float32Array (-1.0〜1.0) で、preSpeechPadFrames 分も含んでいる
                             if (isAISpeaking) return;
                             isSpeaking = false;
-                            vadStatusDiv.textContent = "発話終了 (無音タイマー起動)";
-                            if (isRecording) startSilenceTimer(); 
+                            vadStatusDiv.textContent = "発話終了。送信します...";
+                            
+                            // WebSocketが繋がっているならWAVに変換して送信
+                            if (ws && ws.readyState === WebSocket.OPEN) {
+                                sendAudioAsWav(audio);
+                                statusDiv.textContent = '音声を送信中...';
+                                vad?.pause(); 
+                            }
                         }
                     });
 
@@ -431,89 +377,85 @@ async def get_root():
                 }
             }
 
-            // --- 3. MediaRecorder のセットアップ (変更なし) ---
-            function setupMediaRecorder(stream) {
-                mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' });
-                mediaRecorder.ondataavailable = (event) => {
-                    if (event.data.size > 0) audioChunks.push(event.data);
-                };
-                mediaRecorder.onstop = () => {
-                    isRecording = false;
-                    if (audioChunks.length === 0) {
-                        if (!isAISpeaking && vad) vad.start(); 
-                        return;
-                    }
-                    const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
-                    audioChunks = []; 
-                    if (ws && ws.readyState === WebSocket.OPEN) {
-                        ws.send(audioBlob); 
-                        statusDiv.textContent = '音声を送信中...';
-                        vadStatusDiv.textContent = 'サーバー処理中...';
-                        vad?.pause(); 
-                    }
-                };
-                mediaRecorder.onstart = () => {
-                    isRecording = true;
-                    audioChunks = []; 
-                };
-            }
-            
-            function startMediaRecorder() {
-                if (mediaRecorder && !isRecording && !isAISpeaking) mediaRecorder.start(); 
-            }
-            
-            function stopMediaRecorder() {
-                if (mediaRecorder && isRecording) mediaRecorder.stop();
+            // --- 4. ヘルパー: Float32ArrayをWAVに変換して送信 ---
+            function sendAudioAsWav(float32Array) {
+                // 16kHzにリサンプリングしたいが、ブラウザのAudioContext依存になるため
+                // ここではVADが取得したレート(通常16kHzか44.1kHzか48kHz)のまま送る。
+                // pydub側で16kHzに変換するので問題なし。
+                
+                const wavBuffer = encodeWAV(float32Array, 16000); // VADはデフォルト16kHzで動作することが多いが環境による
+                const blob = new Blob([wavBuffer], { type: 'audio/wav' });
+                ws.send(blob);
             }
 
-            // --- 5. 無音タイマー (変更なし) ---
-            function startSilenceTimer() {
-                if (silenceTimer) clearTimeout(silenceTimer);
-                silenceTimer = setTimeout(() => {
-                    if (isRecording && !isSpeaking) {
-                        vadStatusDiv.textContent = "無音検出。送信します。";
-                        stopMediaRecorder();
-                    }
-                    silenceTimer = null;
-                }, SILENCE_THRESHOLD_MS);
+            // 簡易WAVエンコーダー (Float32 -> Int16 PCM WAV)
+            function encodeWAV(samples, sampleRate) {
+                const buffer = new ArrayBuffer(44 + samples.length * 2);
+                const view = new DataView(buffer);
+
+                // RIFF chunk
+                writeString(view, 0, 'RIFF');
+                view.setUint32(4, 36 + samples.length * 2, true);
+                writeString(view, 8, 'WAVE');
+                
+                // fmt sub-chunk
+                writeString(view, 12, 'fmt ');
+                view.setUint32(16, 16, true);
+                view.setUint16(20, 1, true); // PCM
+                view.setUint16(22, 1, true); // Mono
+                view.setUint32(24, sampleRate, true);
+                view.setUint32(28, sampleRate * 2, true);
+                view.setUint16(32, 2, true);
+                view.setUint16(34, 16, true);
+
+                // data sub-chunk
+                writeString(view, 36, 'data');
+                view.setUint32(40, samples.length * 2, true);
+
+                // Write PCM samples
+                floatTo16BitPCM(view, 44, samples);
+
+                return view;
             }
 
-            // --- 6. VAD停止 (変更なし) ---
+            function writeString(view, offset, string) {
+                for (let i = 0; i < string.length; i++) {
+                    view.setUint8(offset + i, string.charCodeAt(i));
+                }
+            }
+
+            function floatTo16BitPCM(output, offset, input) {
+                for (let i = 0; i < input.length; i++, offset += 2) {
+                    let s = Math.max(-1, Math.min(1, input[i]));
+                    s = s < 0 ? s * 0x8000 : s * 0x7FFF;
+                    output.setInt16(offset, s, true);
+                }
+            }
+
+            // --- 5. VAD停止 ---
             function stopVAD() {
                 vad?.destroy(); 
                 vad = null;
                 mediaStream?.getTracks().forEach(track => track.stop());
                 mediaStream = null;
-                if (mediaRecorder && isRecording) mediaRecorder.stop();
-                isRecording = false;
+                isSpeaking = false;
                 startButton.disabled = false;
                 stopButton.disabled = true;
                 interruptButton.disabled = true;
                 statusDiv.textContent = 'マイクが停止しました。';
             }
             
-            // --- 7. 音声再生制御 (大幅変更) ---
-            
-            // ★★★ キューから取り出して再生する関数 ★★★
+            // --- 6. 音声再生制御 (ストリーミング版と同じ) ---
             function processAudioQueue() {
-                // すでに再生中なら何もしない（終わるのを待つ）
                 if (isPlaying) return;
-                
-                // キューが空の場合
                 if (audioQueue.length === 0) {
-                    // サーバーからの送信が全て終わっているなら、全体の処理を終了
-                    if (isServerDone) {
-                        finishPlayback();
-                    }
+                    if (isServerDone) finishPlayback();
                     return;
                 }
-
-                // キューの先頭を取り出す
                 const nextBlob = audioQueue.shift();
                 playAudioBlob(nextBlob);
             }
 
-            // ★★★ 単発のBlobを再生する関数 ★★★
             function playAudioBlob(blob) {
                 isPlaying = true;
                 isAISpeaking = true;
@@ -521,31 +463,25 @@ async def get_root():
                 statusDiv.textContent = '音声回答を再生中...';
                 interruptButton.disabled = false;
 
-                // 古いURLの解放
                 if (currentAudioUrl) URL.revokeObjectURL(currentAudioUrl);
-                
                 currentAudioUrl = URL.createObjectURL(blob);
                 
-                // 既存のプレイヤーがあれば停止
                 if (currentAudio) {
                     currentAudio.pause();
-                    currentAudio.onended = null; // イベントリスナ解除
+                    currentAudio.onended = null;
                 }
 
-                audioPlayback.innerHTML = ''; // 前のプレイヤー消去
+                audioPlayback.innerHTML = ''; 
                 currentAudio = new Audio(currentAudioUrl);
                 currentAudio.controls = true;
                 currentAudio.autoplay = true;
 
-                // 再生終了時の処理
                 currentAudio.onended = () => {
                     console.log("断片再生完了");
                     isPlaying = false;
-                    // 次の断片があるかチェックしに行く
                     processAudioQueue();
                 };
 
-                // エラー時も次へ進む
                 currentAudio.onerror = (e) => {
                     console.error("再生エラー", e);
                     isPlaying = false;
@@ -555,13 +491,12 @@ async def get_root():
                 audioPlayback.appendChild(currentAudio);
             }
 
-            // ★★★ 再生完了・中断時のリセット処理 ★★★
             function finishPlayback() {
                 console.log("全再生完了。待機状態に戻ります。");
                 isAISpeaking = false;
                 isPlaying = false;
                 isServerDone = false;
-                audioQueue = []; // キューをクリア
+                audioQueue = []; 
                 interruptButton.disabled = true; 
 
                 if (currentAudio) {
@@ -574,16 +509,15 @@ async def get_root():
                 vadStatusDiv.textContent = '待機中...';
             }
 
-            // ★★★ 中断ボタン ★★★
             function interruptAudio() {
                 console.log("ユーザー操作により再生を中断します。");
-                audioQueue = []; // 溜まっている音声も破棄
-                isServerDone = true; // 強制的に完了扱い
+                audioQueue = []; 
+                isServerDone = true; 
                 finishPlayback();
                 statusDiv.textContent = '中断しました。どうぞお話しください。';
             }
 
-            // --- 8. イベント ---
+            // --- イベント ---
             startButton.onclick = setupVAD;
             stopButton.onclick = stopVAD;
             interruptButton.onclick = interruptAudio; 

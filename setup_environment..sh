@@ -6,7 +6,7 @@ set -e  # エラーが起きたら停止
 # 1. システムライブラリ
 # -------------------------------------
 apt-get update
-apt-get install -y libcudnn9-cuda-12 libcudnn9-dev-cuda-12 ffmpeg
+apt-get install --allow-change-held-packages -y libcudnn9-cuda-12 libcudnn9-dev-cuda-12 ffmpeg
 # cuDNN ライブラリをシステムに認識させる
 export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
 ldconfig

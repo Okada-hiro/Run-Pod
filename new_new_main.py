@@ -12,7 +12,7 @@ import sys
 from pydub import AudioSegment
 import io
 import re
-from speaker_filter import SpeakerGuard
+
 
 speaker_guard = SpeakerGuard()
 
@@ -36,7 +36,7 @@ try:
     from new_text_to_speech import synthesize_speech
 except ImportError as e:
     print(f"[ERROR] 必要なモジュールが見つかりません: {e}")
-
+from speaker_filter import SpeakerGuard
 # --- 設定 ---
 PROCESSING_DIR = "incoming_audio" 
 LANGUAGE = "ja"

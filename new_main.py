@@ -28,7 +28,7 @@ try:
     from new_answer_generator import generate_answer, generate_answer_stream
     from new_text_to_speech import synthesize_speech
 except ImportError:
-    print("[ERROR] 必要なモジュール(transcribe_func, answer_generator, new_text_to_speech)が見つかりません。")
+    print("[ERROR] 必要なモジュール(transcribe_func, new_answer_generator, new_text_to_speech)が見つかりません。")
     exit(1)
 
 # --- 設定 ---

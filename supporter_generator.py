@@ -1,4 +1,4 @@
-# /workspace/supporter_generator.py (完全修正版)
+# /workspace/supporter_generator.py
 
 import google.generativeai as genai
 import os
@@ -12,7 +12,7 @@ if GOOGLE_API_KEY:
         print(f"[ERROR] Google genai の設定に失敗: {e}")
 
 
-# --- システムプロンプトの定義 ---
+# --- システムプロンプト ---
 SYSTEM_PROMPT = """
 あなたは保険代理店の電話対応を行うAIアドバイザーです。
 お客様の音声認識結果に対し、以下の優先順位とルールに従って応答してください。
@@ -50,57 +50,14 @@ User: "（横の人に）ねえ、これ意外と高いよね"
 AI: [SILENCE]
 """
 
-# デフォルトモデル
-# ※注意: gemini-2.5-flash-lite というモデルはAPIに存在しない可能性があるため、
-# 確実に動作する gemini-2.5-flash にしています。
+# 確実に動作するモデル名を使用
 DEFAULT_MODEL = "gemini-2.5-flash-lite"
-
-def generate_answer(question: str, model=DEFAULT_MODEL, history: list = None) -> str:
-    """
-    通常応答用関数（一括回答）
-    """
-    print(f"[DEBUG] 回答生成中... (モデル: {model})")
-    if history is None:
-        history = []
-
-    if not question:
-        return "質問を聞き取れませんでした。"
-
-    answer = ""
-
-    try:
-        if model.startswith("gemini-"):
-            if not GOOGLE_API_KEY:
-                raise ValueError("GOOGLE_API_KEY が設定されていません")
-            
-            model_instance = genai.GenerativeModel(
-                model_name=model,
-                system_instruction=SYSTEM_PROMPT,
-                generation_config={"temperature": 0.2}
-            )
-            
-            chat_session = model_instance.start_chat(history=history)
-            
-            # ★ 修正点: 一括取得なので stream=False に設定
-            # これにより .text プロパティに安全にアクセスできます
-            response = chat_session.send_message(question, stream=False)
-            answer = response.text.strip()
-
-        else:
-            raise ValueError(f"対応していないモデル名です: {model}")
-
-    except Exception as e:
-        print(f"[ERROR] {model} での回答生成に失敗しました: {e}")
-        answer = f"申し訳ありません、エラーが発生しました。"
-
-    return answer
-
 
 def generate_answer_stream(question: str, model=DEFAULT_MODEL, history: list = None):
     """
     回答をストリーミング(ジェネレータ)として返す
     """
-    # history引数を受け取れるように修正
+    # 履歴がない場合は空リストを作成
     if history is None:
         history = []
         
@@ -121,13 +78,16 @@ def generate_answer_stream(question: str, model=DEFAULT_MODEL, history: list = N
                 generation_config={"temperature": 0.2}
             )
             
+            # ★ 会話履歴を渡してチャットを開始
             chat_session = model_instance.start_chat(history=history)
             
-            # ストリーミング送信 (stream=True)
+            # ★ ストリーミング送信 (stream=True)
             response = chat_session.send_message(question, stream=True)
             
-            # ★ 重要: ここで response.text にアクセスしてはいけません！
-            # ループの中でチャンクごとに処理します
+            # ★ エラー修正の要: 
+            # ここで response.text にアクセスしてはいけません。
+            # 直接ループで回してチャンクを取得します。
+            
             for chunk in response:
                 if chunk.text:
                     yield chunk.text
@@ -138,14 +98,11 @@ def generate_answer_stream(question: str, model=DEFAULT_MODEL, history: list = N
         print(f"[ERROR] ストリーミング生成エラー: {e}")
         yield "申し訳ありません、エラーが発生しました。"
 
-# --- テスト実行 ---
+# --- 単体テスト ---
 if __name__ == "__main__":
-    print("--- 単体テスト ---")
+    print("--- テスト実行 ---")
     if GOOGLE_API_KEY:
-        # テスト実行
-        iterator = generate_answer_stream("こんにちは", model="gemini-1.5-flash", history=[])
+        iterator = generate_answer_stream("こんにちは", history=[])
         for text in iterator:
             print(text, end="", flush=True)
         print("\n")
-    else:
-        print("APIキーがありません")

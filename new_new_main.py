@@ -1,4 +1,4 @@
-# /workspace/new_new_main.py
+# /workspace/new_main.py
 import uvicorn
 from fastapi import FastAPI, WebSocket, Request
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
@@ -21,22 +21,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- 既存の処理モジュールをインポート ---
+# --- 処理モジュールのインポート ---
 try:
     from transcribe_func import whisper_text_only
-    # ファイル名が new_answer_generator ではなく supporter_generator である場合は適宜変更してください
-    # ここではユーザーコードのファイル名に従い supporter_generator と仮定して修正します
-    # もしファイル名が違う場合は import元を変更してください
+    # supporter_generator を優先してインポート
     try:
-        from supporter_generator import generate_answer, generate_answer_stream
+        from supporter_generator import generate_answer_stream
     except ImportError:
-        from new_answer_generator import generate_answer, generate_answer_stream
+        # ファイル名が違う場合のバックアップ
+        from new_answer_generator import generate_answer_stream
 
     from new_text_to_speech import synthesize_speech
 except ImportError as e:
     print(f"[ERROR] 必要なモジュールが見つかりません: {e}")
-    # 動作確認のため一時的にpassしないようにexitします
-    # exit(1) 
+    # 動作確認のため、インポートエラーでも起動だけはするようにexitはコメントアウトしています
+    # exit(1)
 
 # --- 設定 ---
 PROCESSING_DIR = "incoming_audio" 
@@ -49,12 +48,12 @@ app.mount(f"/download", StaticFiles(directory=PROCESSING_DIR), name="download")
 
 
 # ---------------------------
-# 1. 文ごとの処理関数 (字幕送信 -> 音声合成 -> 音声送信)
+# 1. 文ごとの処理関数
 # ---------------------------
 async def process_sentence(text: str, base_filename: str, index: int, websocket: WebSocket):
     logger.info(f"[STREAM] 文{index}: {text[:20]}...")
     
-    # (A) 先に字幕テキストを送る
+    # (A) 字幕送信
     try:
         await websocket.send_json({
             "status": "reply_chunk",
@@ -75,13 +74,13 @@ async def process_sentence(text: str, base_filename: str, index: int, websocket:
     
     if success:
         try:
-            # (C) WAV -> MP3 変換 (軽量化)
+            # (C) WAV -> MP3
             audio_segment = AudioSegment.from_wav(part_path_abs)
             mp3_buffer = io.BytesIO()
             audio_segment.export(mp3_buffer, format="mp3", bitrate="128k")
             audio_data = mp3_buffer.getvalue()
 
-            # (D) バイナリ音声送信
+            # (D) 送信
             await websocket.send_bytes(audio_data)
         except Exception as e:
             logger.error(f"[STREAM ERROR] 音声変換・送信中にエラー: {e}", exc_info=True)
@@ -90,12 +89,14 @@ async def process_sentence(text: str, base_filename: str, index: int, websocket:
 # ---------------------------
 # 2. バックグラウンド処理 (メインフロー)
 # ---------------------------
+# ★ chat_history を受け取るように変更
 async def process_audio_file(audio_path: str, original_filename: str, websocket: WebSocket, chat_history: list):
     logger.info(f"[TASK START] ファイル処理開始: {original_filename}")
     
     try:
         # --- 文字起こし ---
         output_txt_path = os.path.join(PROCESSING_DIR, original_filename + ".txt")
+        logger.info(f"[TASK] 文字起こし中...")
         
         question_text = await asyncio.to_thread(
             whisper_text_only,
@@ -103,10 +104,9 @@ async def process_audio_file(audio_path: str, original_filename: str, websocket:
         )
         logger.info(f"[TASK] 文字起こし完了: {question_text}")
 
-        # フロントエンドに「聞き取りました」と通知
         await websocket.send_json({
             "status": "transcribed",
-            "message": "...", # 最初は何も表示しない、または「思考中」
+            "message": "...",
             "question_text": question_text
         })
 
@@ -116,59 +116,45 @@ async def process_audio_file(audio_path: str, original_filename: str, websocket:
         text_buffer = ""
         sentence_count = 0
         full_answer_log = ""
-        
-        # 句読点(。！？)または改行で分割する正規表現
         split_pattern = r'(?<=[。！？\n])'
 
-        # ★ ここで現在の履歴を渡して生成
-        # LLMからストリーミングで文字を受け取る
-        # ★ モデル名を修正 (gemini-2.5-flash-lite)
-        iterator = generate_answer_stream(question_text, model="gemini-2.5-flash-lite", history=chat_history)
+        # ★ 履歴(chat_history)を渡して生成
+        iterator = generate_answer_stream(question_text, history=chat_history)
 
         for chunk_text in iterator:
             text_buffer += chunk_text
             full_answer_log += chunk_text 
 
-            # ★ [SILENCE] 判定ロジック
-            # ストリームの途中でも、全体が [SILENCE] になりそうなら検知したい
-            # ただし、普通に話しているときも文頭で判定しないように注意が必要
-            # ここでは「バッファ全体が [SILENCE] と一致したら即停止」とします
+            # [SILENCE] チェック
             if full_answer_log.strip() == "[SILENCE]":
                 logger.info("[TASK] SILENCE検出。応答をスキップします。")
                 await websocket.send_json({"status": "ignored", "message": "（音声を無視しました）"})
-                return  # 処理終了
+                return  # ★ 履歴に追加せずにここで終了
 
-            # バッファ分割チェック
+            # バッファ分割
             sentences = re.split(split_pattern, text_buffer)
-
             if len(sentences) > 1:
-                # 確定した文(最後以外)を処理
                 for sent in sentences[:-1]:
                     if sent.strip():
                         sentence_count += 1
                         await process_sentence(sent, original_filename, sentence_count, websocket)
-                
-                # 残りをバッファに戻す
                 text_buffer = sentences[-1]
 
-        # ループ終了後の残りかす処理
+        # 残り処理
         if text_buffer.strip():
-            # 最後の最後で [SILENCE] だった場合（ストリームが一括で来た場合など）
             if text_buffer.strip() == "[SILENCE]":
-                 logger.info("[TASK] SILENCE検出(末尾)。応答をスキップします。")
                  await websocket.send_json({"status": "ignored", "message": "（音声を無視しました）"})
                  return
 
             sentence_count += 1
             await process_sentence(text_buffer, original_filename, sentence_count, websocket)
-
-        # --- ★ ここが重要：回答が完了したら履歴に追加 ---
-        # Geminiの履歴フォーマットに合わせて追加
+        
+        # ★ 回答完了後に履歴を更新 (SILENCEでなければここに来る)
         chat_history.append({"role": "user", "parts": [question_text]})
         chat_history.append({"role": "model", "parts": [full_answer_log]})
-        # 完了通知
+        
         await websocket.send_json({"status": "complete", "answer_text": full_answer_log})
-        logger.info(f"[TASK END] ストリーミング完了: {original_filename}")
+        logger.info(f"[TASK END] 完了. 現在の履歴数: {len(chat_history)//2}ターン")
 
     except Exception as e:
         logger.error(f"[TASK ERROR] エラー: {e}", exc_info=True)
@@ -183,9 +169,11 @@ async def process_audio_file(audio_path: str, original_filename: str, websocket:
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    logger.info("[WS] クライアントが接続しました。")
-    # ★ ここで接続ごとの会話履歴を初期化
+    logger.info("[WS] クライアント接続")
+    
+    # ★ 接続ごとに履歴を初期化
     chat_history = []
+    
     try:
         while True:
             audio_data = await websocket.receive_bytes()
@@ -195,7 +183,6 @@ async def websocket_endpoint(websocket: WebSocket):
             output_wav_filename = f"{temp_id}.wav"
             output_wav_path = os.path.join(PROCESSING_DIR, output_wav_filename)
             
-            # pydubでフォーマット自動判別してWAV化
             def convert_audio():
                 try:
                     audio = AudioSegment.from_file(audio_io) 
@@ -203,27 +190,27 @@ async def websocket_endpoint(websocket: WebSocket):
                     audio.export(output_wav_path, format="wav")
                     return True
                 except Exception as e:
-                    logger.error(f"[WS ERROR] pydub 変換失敗: {e}")
+                    logger.error(f"[WS ERROR] 変換失敗: {e}")
                     return False
 
             if not await asyncio.to_thread(convert_audio):
-                await websocket.send_json({"status": "error", "message": "音声形式の変換に失敗しました。"})
+                await websocket.send_json({"status": "error", "message": "音声形式エラー"})
                 continue
             
-            # 処理開始通知
-            await websocket.send_json({"status": "processing", "message": "音声を認識しています..."})
+            await websocket.send_json({"status": "processing", "message": "認識中..."})
 
+            # ★ chat_history を渡してタスク起動
             asyncio.create_task(process_audio_file(
                 output_wav_path, 
                 output_wav_filename, 
                 websocket,
-                chat_history  # <--- これが必要です！
+                chat_history
             ))
             
     except WebSocketDisconnect:
-        logger.info("[WS] クライアントが切断しました。")
+        logger.info("[WS] 切断")
     except Exception as e:
-        logger.error(f"[WS ERROR] WebSocketエラー: {e}", exc_info=True)
+        logger.error(f"[WS ERROR] : {e}", exc_info=True)
     finally:
         try:
             await websocket.close()
@@ -242,7 +229,7 @@ async def get_root():
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device.width, initial-scale=1.0">
-        <title>AI Voice Talk (Silence Aware)</title>
+        <title>AI Voice Talk</title>
         
         <style>
             body { font-family: sans-serif; display: grid; place-items: center; min-height: 90vh; background: #f4f4f4; }
@@ -379,11 +366,11 @@ async def get_root():
                     answerTextDiv.textContent += data.text_chunk;
 
                 } else if (data.status === 'ignored') {
-                    // ★ 無視された場合の処理
+                    // ★ 無視された場合の処理を追加
                     console.log("サーバーにより無視されました");
                     answerTextDiv.textContent = "(応答なし)";
                     isServerDone = true;
-                    finishPlayback(); // 即座に待機に戻る
+                    finishPlayback(); 
 
                 } else if (data.status === 'complete') {
                     console.log("サーバー生成完了");
@@ -451,7 +438,7 @@ async def get_root():
                 ws.send(blob);
             }
 
-            // --- WAVエンコード関数は変更なし ---
+            // --- WAVエンコード関数 (いただいた元のコードを維持) ---
             function encodeWAV(samples, sampleRate) {
                 const buffer = new ArrayBuffer(44 + samples.length * 2);
                 const view = new DataView(buffer);

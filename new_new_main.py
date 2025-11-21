@@ -216,7 +216,8 @@ async def websocket_endpoint(websocket: WebSocket):
             asyncio.create_task(process_audio_file(
                 output_wav_path, 
                 output_wav_filename, 
-                websocket
+                websocket,
+                chat_history  # <--- これが必要です！
             ))
             
     except WebSocketDisconnect:

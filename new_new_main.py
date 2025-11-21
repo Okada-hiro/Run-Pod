@@ -90,7 +90,7 @@ async def process_sentence(text: str, base_filename: str, index: int, websocket:
 # ---------------------------
 # 2. バックグラウンド処理 (メインフロー)
 # ---------------------------
-async def process_audio_file(audio_path: str, original_filename: str, websocket: WebSocket):
+async def process_audio_file(audio_path: str, original_filename: str, websocket: WebSocket, chat_history: list):
     logger.info(f"[TASK START] ファイル処理開始: {original_filename}")
     
     try:
@@ -119,6 +119,9 @@ async def process_audio_file(audio_path: str, original_filename: str, websocket:
         
         # 句読点(。！？)または改行で分割する正規表現
         split_pattern = r'(?<=[。！？\n])'
+
+        # ★ ここで現在の履歴を渡して生成
+        iterator = generate_answer_stream(question_text, history=chat_history)
 
         # LLMからストリーミングで文字を受け取る
         # ★ モデル名を修正 (gemini-2.5-flash-lite)
@@ -160,7 +163,11 @@ async def process_audio_file(audio_path: str, original_filename: str, websocket:
 
             sentence_count += 1
             await process_sentence(text_buffer, original_filename, sentence_count, websocket)
-        
+
+        # --- ★ ここが重要：回答が完了したら履歴に追加 ---
+        # Geminiの履歴フォーマットに合わせて追加
+        chat_history.append({"role": "user", "parts": [question_text]})
+        chat_history.append({"role": "model", "parts": [full_answer_log]})
         # 完了通知
         await websocket.send_json({"status": "complete", "answer_text": full_answer_log})
         logger.info(f"[TASK END] ストリーミング完了: {original_filename}")
@@ -179,6 +186,8 @@ async def process_audio_file(audio_path: str, original_filename: str, websocket:
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     logger.info("[WS] クライアントが接続しました。")
+    # ★ ここで接続ごとの会話履歴を初期化
+    chat_history = []
     try:
         while True:
             audio_data = await websocket.receive_bytes()

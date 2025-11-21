@@ -12,7 +12,7 @@ google-generativeai
 # 音声認識 (Whisper)
 faster-whisper
 librosa
-numpy # librosa や torch の依存]
+numpy # librosa や torch の依存
 loguru
 transformers
 

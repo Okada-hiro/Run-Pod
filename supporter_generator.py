@@ -65,13 +65,16 @@ AI: [SILENCE]
 """
 
 # --- 2. モデル名に応じて処理を分岐する ---
-
-def generate_answer(question: str, model="gemini-2.5-flash-lite") -> str:
+DEFAULT_MODEL = "gemini-2.5-flash-lite"
+def generate_answer(question: str, model=DEFAULT_MODEL, history: list = None) -> str:
     """
     受け取った質問テキストに対し、指定されたモデルで回答を生成する。
     """
     print(f"[DEBUG] 回答生成中... (モデル: {model}) 質問: '{question}'")
-    
+    if history is None:
+        history = []
+
+    print(f"[DEBUG] ストリーミング生成開始... (履歴数: {len(history)})")
     if not question:
         return "質問を聞き取れませんでした。"
 
@@ -88,7 +91,11 @@ def generate_answer(question: str, model="gemini-2.5-flash-lite") -> str:
                 model_name=model,
                 system_instruction=SYSTEM_PROMPT
             )
-            response = model_instance.generate_content(question)
+            # ★ ここを変更: start_chat で履歴付きセッションを開始
+            chat_session = model_instance.start_chat(history=history)
+            
+            # 履歴を踏まえてメッセージを送信
+            response = chat_session.send_message(question, stream=True)
             answer = response.text.strip()
 
         else:

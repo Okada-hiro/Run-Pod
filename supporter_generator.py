@@ -51,7 +51,7 @@ AI: [SILENCE]
 """
 
 # モデル名 (確実に動作するもの)
-DEFAULT_MODEL = "gemini-1.5-flash"
+DEFAULT_MODEL = "gemini-2.5-flash-lite"
 
 def generate_answer_stream(question: str, model=DEFAULT_MODEL, history: list = None):
     """

@@ -14,7 +14,7 @@ import io
 import re
 from speaker_filter import SpeakerGuard
 
-
+speaker_guard = SpeakerGuard()
 
 # --- ロギング設定 ---
 logging.basicConfig(

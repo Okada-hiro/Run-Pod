@@ -121,11 +121,9 @@ async def process_audio_file(audio_path: str, original_filename: str, websocket:
         split_pattern = r'(?<=[。！？\n])'
 
         # ★ ここで現在の履歴を渡して生成
-        iterator = generate_answer_stream(question_text, history=chat_history)
-
         # LLMからストリーミングで文字を受け取る
         # ★ モデル名を修正 (gemini-2.5-flash-lite)
-        iterator = generate_answer_stream(question_text, model="gemini-2.5-flash-lite")
+        iterator = generate_answer_stream(question_text, model="gemini-2.5-flash-lite", history=chat_history)
 
         for chunk_text in iterator:
             text_buffer += chunk_text

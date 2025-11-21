@@ -1,7 +1,7 @@
 # /workspace/speaker_filter.py
 import torch
 import torchaudio
-from speechbrain.inference.speakers import EncoderClassifier
+from speechbrain.inference.speaker import EncoderClassifier
 import os
 
 # --- 1. 音声読み込み関数 ---

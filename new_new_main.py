@@ -14,14 +14,7 @@ import io
 import re
 from speaker_filter import SpeakerGuard
 
-# ★★★ 追加: PyTorchのJITコンパイルエラー回避設定 ★★★
-os.environ["PYTORCH_JIT"] = "0"  # JITを無効化
 
-import torch
-# JIT最適化を明示的にオフにする（念のため）
-torch.jit.set_fusion_strategy([('STATIC', 0)]) 
-torch.backends.cudnn.allow_tf32 = True
-speaker_guard = SpeakerGuard()
 
 # --- ロギング設定 ---
 logging.basicConfig(

@@ -1,4 +1,4 @@
-# /workspace/new_new_main.py (完全修正版)
+# /workspace/new_new_main.py (完全修正版: Web Audio API対応)
 import uvicorn
 from fastapi import FastAPI, WebSocket, Request
 from fastapi.responses import HTMLResponse, FileResponse
@@ -217,7 +217,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
 
 # ---------------------------
-# 4. フロントエンド (修正版 HTML/JS)
+# 4. フロントエンド (修正版 HTML/JS - Web Audio API版)
 # ---------------------------
 @app.get("/", response_class=HTMLResponse)
 async def get_root():
@@ -227,7 +227,7 @@ async def get_root():
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device.width, initial-scale=1.0">
-        <title>AI Voice Talk (Barge-In)</title>
+        <title>AI Voice Talk (Web Audio API)</title>
         
         <style>
             body { font-family: sans-serif; display: grid; place-items: center; min-height: 90vh; background: #f0f2f5; }
@@ -262,8 +262,6 @@ async def get_root():
             
             .ai-bubble { background: #f0fff4; color: #155724; margin-right: 20px; border-bottom-left-radius: 2px;}
             .ai-bubble::before { content: 'AI'; font-size: 0.7rem; position: absolute; top: -18px; left: 0; color: #999; }
-
-            #audioPlayback { margin-top: 1rem; display: none; }
         </style>
     </head>
     <body>
@@ -279,39 +277,69 @@ async def get_root():
             <div id="status">準備完了</div>
             <div id="vad-status">(待機中)</div>
             
-            <div id="qa-display">
-                </div>
-
-            <div id="audioPlayback"></div>
+            <div id="qa-display"></div>
         </div>
 
         <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.wasm.min.js"></script>
         <script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.29/dist/bundle.min.js"></script>
 
         <script>
-            // --- DOM要素 ---
+            // --- グローバル変数 ---
             const startButton = document.getElementById('startButton');
             const stopButton = document.getElementById('stopButton');
             const statusDiv = document.getElementById('status');
             const vadStatusDiv = document.getElementById('vad-status');
             const qaDisplay = document.getElementById('qa-display');
-            const audioPlayback = document.getElementById('audioPlayback');
 
-            // --- グローバル変数 ---
             let ws;
             let vad; 
             let mediaStream; 
             
+            // Web Audio API用の変数
+            let audioCtx = null;
+            let currentSource = null; // 現在再生中のソース
+            
             let isSpeaking = false;     
-            let isAISpeaking = false;   
             let audioQueue = [];        
             let isPlaying = false;      
-            let currentAudio = null;    
-            
-            // バージイン制御用: 「前の回答」の残党を無視するためのフラグ
             let ignoreIncomingAudio = false; 
 
-            // UI操作系
+            // --- 1. WebSocket接続 ---
+            function connectWebSocket() {
+                const wsProtocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
+                ws = new WebSocket(wsProtocol + window.location.host + '/ws');
+                ws.binaryType = 'arraybuffer';
+
+                ws.onopen = () => {
+                    console.log('WebSocket 接続');
+                    statusDiv.textContent = '接続完了。マイクをONにしてください。';
+                    startButton.disabled = false;
+                };
+
+                ws.onmessage = (event) => {
+                    if (event.data instanceof ArrayBuffer) {
+                        if (ignoreIncomingAudio) return;
+                        const audioBlob = new Blob([event.data], { type: 'audio/mp3' });
+                        audioQueue.push(audioBlob);
+                        processAudioQueue();
+                    } else {
+                        try {
+                            const data = JSON.parse(event.data);
+                            handleJsonMessage(data);
+                        } catch (e) { console.error(e); }
+                    }
+                };
+
+                ws.onclose = () => {
+                    statusDiv.textContent = '再接続してください。';
+                    stopVAD(); 
+                };
+            }
+
+            // --- 2. UI操作 ---
+            let currentQuestionId = null;
+            let currentAnswerId = null;
+
             function appendBubble(role, text, id) {
                 let div = document.getElementById(id);
                 if (!div) {
@@ -322,107 +350,127 @@ async def get_root():
                     qaDisplay.scrollTop = qaDisplay.scrollHeight;
                 }
                 div.textContent = text;
-                return div;
             }
-
-            function connectWebSocket() {
-                const wsProtocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
-                ws = new WebSocket(wsProtocol + window.location.host + '/ws');
-                ws.binaryType = 'arraybuffer';
-
-                ws.onopen = () => {
-                    console.log('WebSocket 接続');
-                    statusDiv.textContent = '接続しました。マイクをONにしてください。';
-                    startButton.disabled = false;
-                };
-
-                ws.onmessage = (event) => {
-                    // (A) 音声データ受信
-                    if (event.data instanceof ArrayBuffer) {
-                        if (ignoreIncomingAudio) {
-                            console.log("割り込み済みのため、古い音声パケットを破棄");
-                            return;
-                        }
-                        const audioBlob = new Blob([event.data], { type: 'audio/mp3' });
-                        audioQueue.push(audioBlob);
-                        processAudioQueue();
-                    } 
-                    // (B) 制御メッセージ受信
-                    else {
-                        try {
-                            const data = JSON.parse(event.data);
-                            handleJsonMessage(data);
-                        } catch (e) { console.error(e); }
-                    }
-                };
-
-                ws.onclose = () => {
-                    statusDiv.textContent = 'サーバー切断。リロード推奨。';
-                    stopVAD(); 
-                };
-            }
-
-            // JSONメッセージハンドリング
-            let currentQuestionId = null;
-            let currentAnswerId = null;
 
             function handleJsonMessage(data) {
                 if (data.status === 'processing') {
                     statusDiv.textContent = data.message;
-                    
                 } else if (data.status === 'transcribed') {
                     currentQuestionId = `q-${Date.now()}`;
                     appendBubble('user', data.question_text, currentQuestionId);
-                    
                     currentAnswerId = `a-${Date.now()}`;
                     appendBubble('ai', '...', currentAnswerId);
-
                 } else if (data.status === 'reply_chunk') {
-                    if (ignoreIncomingAudio) return; 
-                    
+                    if (ignoreIncomingAudio) return;
                     const div = document.getElementById(currentAnswerId);
                     if (div) {
                         if (div.textContent === '...') div.textContent = '';
                         div.textContent += data.text_chunk;
                         qaDisplay.scrollTop = qaDisplay.scrollHeight;
                     }
-
                 } else if (data.status === 'ignored') {
-                    statusDiv.textContent = "（音声を無視しました）";
-                    if (currentAnswerId) {
-                         const div = document.getElementById(currentAnswerId);
-                         if(div) div.textContent = "(応答なし)";
-                    }
-
+                    statusDiv.textContent = "(音声を無視しました)";
+                    const div = document.getElementById(currentAnswerId);
+                    if(div) div.textContent = "(応答なし)";
                 } else if (data.status === 'error') {
                     statusDiv.textContent = `エラー: ${data.message}`;
                 }
             }
 
-            // --- ★重要: Autoplayポリシー回避のためのハック ---
-            function unlockAudioContext() {
-                const ctx = new (window.AudioContext || window.webkitAudioContext)();
-                const buffer = ctx.createBuffer(1, 1, 22050); 
-                const source = ctx.createBufferSource();
+            // --- 3. Web Audio API 初期化 (最重要) ---
+            // ボタンクリック時に1回だけ呼び出し、コンテキストを「再開(resume)」状態にする
+            async function initAudioContext() {
+                if (!audioCtx) {
+                    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                }
+                
+                // ブラウザによってサスペンドされている場合は再開させる
+                if (audioCtx.state === 'suspended') {
+                    await audioCtx.resume();
+                }
+
+                // 無音を再生して確実にロック解除する
+                const buffer = audioCtx.createBuffer(1, 1, 22050);
+                const source = audioCtx.createBufferSource();
                 source.buffer = buffer;
-                source.connect(ctx.destination);
+                source.connect(audioCtx.destination);
+                source.start(0);
                 
-                // 一瞬再生
-                if (source.start) source.start(0);
-                else if (source.noteOn) source.noteOn(0);
-                
-                console.log("🔓 AudioContext unlocked.");
+                console.log("🔊 AudioContext unlocked/resumed:", audioCtx.state);
             }
 
-            // --- VAD & マイク設定 ---
+            // --- 4. 音声再生ロジック (Web Audio API版) ---
+            function processAudioQueue() {
+                if (isPlaying) return;
+                if (audioQueue.length === 0) return;
+                
+                const nextBlob = audioQueue.shift();
+                playAudioBlob(nextBlob);
+            }
+
+            async function playAudioBlob(blob) {
+                if (!audioCtx) return; // 初期化前なら無視
+
+                isPlaying = true;
+                statusDiv.textContent = '🔊 AI回答中...';
+
+                try {
+                    // Blob -> ArrayBuffer -> AudioBuffer
+                    const arrayBuffer = await blob.arrayBuffer();
+                    const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+
+                    const source = audioCtx.createBufferSource();
+                    source.buffer = audioBuffer;
+                    source.connect(audioCtx.destination);
+                    
+                    currentSource = source; // 中断できるように保存
+
+                    source.onended = () => {
+                        isPlaying = false;
+                        currentSource = null;
+                        processAudioQueue();
+                        
+                        if (audioQueue.length === 0) {
+                            statusDiv.textContent = '🟢 完了。次の質問をどうぞ。';
+                        }
+                    };
+
+                    source.start(0);
+                    
+                } catch (e) {
+                    console.error("再生エラー(decode/play):", e);
+                    isPlaying = false;
+                    processAudioQueue();
+                }
+            }
+
+            // --- 5. 割り込み処理 ---
+            function interruptAudio() {
+                // 再生中のソースを停止
+                if (currentSource) {
+                    try { currentSource.stop(); } catch(e){}
+                    currentSource = null;
+                }
+                
+                audioQueue = [];
+                isPlaying = false;
+                ignoreIncomingAudio = true;
+                statusDiv.textContent = '⛔ 中断。あなたの声を聞いています。';
+                
+                if (currentAnswerId) {
+                    const div = document.getElementById(currentAnswerId);
+                    if (div) div.textContent += " (中断)";
+                }
+            }
+
+            // --- 6. VAD & マイク設定 ---
             async function setupVAD() {
                 try {
                     startButton.disabled = true;
-                    statusDiv.textContent = 'VAD準備中...';
+                    statusDiv.textContent = 'マイク準備中...';
 
                     while (!window.vad) await new Promise(r => setTimeout(r, 50));
                     
-                    // エコーキャンセルを有効にする
                     mediaStream = await navigator.mediaDevices.getUserMedia({ 
                         audio: {
                             echoCancellation: true,
@@ -433,29 +481,23 @@ async def get_root():
                     
                     vad = await window.vad.MicVAD.new({
                         stream: mediaStream,
-                        // 感度調整: 0.9 で自爆(エコー)を減らす
-                        positiveSpeechThreshold: 0.9, 
-                        minSpeechFrames: 4, 
+                        positiveSpeechThreshold: 0.9, // 誤検知防止で少し高め
+                        minSpeechFrames: 4,
                         preSpeechPadFrames: 20,
-                        // ★CDN修正
                         onnxWASMBasePath: "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/",
                         baseAssetPath: "https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.29/dist/",
                         
                         onSpeechStart: () => {
                             isSpeaking = true;
                             vadStatusDiv.textContent = "🗣️ 感知中...";
-                            
-                            // 割り込み処理
                             if (isPlaying || audioQueue.length > 0) {
-                                console.log("⚡ 割り込み発生！ AIの音声を停止します");
-                                interruptAudio();
+                                interruptAudio(); // 割り込み
                             }
                         },
                         
                         onSpeechEnd: (audio) => {
                             isSpeaking = false;
                             vadStatusDiv.textContent = "📡 送信中...";
-                            
                             if (ws && ws.readyState === WebSocket.OPEN) {
                                 ignoreIncomingAudio = false; 
                                 sendAudioAsWav(audio);
@@ -466,79 +508,21 @@ async def get_root():
 
                     vad.start();
                     stopButton.disabled = false;
-                    statusDiv.textContent = '🟢 準備完了。いつでも話しかけてください。';
+                    statusDiv.textContent = '🟢 準備完了。';
                     vadStatusDiv.textContent = '👂 待機中';
 
                 } catch (err) {
-                    console.error('VADエラー:', err);
-                    statusDiv.textContent = 'マイク初期化エラー。';
+                    console.error('VAD/Mic エラー:', err);
+                    statusDiv.textContent = 'マイク初期化失敗。';
                     startButton.disabled = false;
                 }
             }
 
-            // --- 割り込み処理関数 ---
-            function interruptAudio() {
-                if (currentAudio) {
-                    currentAudio.pause();
-                    currentAudio = null;
-                }
-                audioQueue = [];
-                isPlaying = false;
-                isAISpeaking = false;
-                ignoreIncomingAudio = true;
-                statusDiv.textContent = '⛔ 中断しました。あなたの声を聞いています。';
-                
-                if (currentAnswerId) {
-                    const div = document.getElementById(currentAnswerId);
-                    if (div) div.textContent += " (中断)";
-                }
-            }
-
-            // --- 音声再生ロジック ---
-            function processAudioQueue() {
-                if (isPlaying) return;
-                if (audioQueue.length === 0) return;
-                
-                const nextBlob = audioQueue.shift();
-                playAudioBlob(nextBlob);
-            }
-
-            function playAudioBlob(blob) {
-                isPlaying = true;
-                isAISpeaking = true; 
-                statusDiv.textContent = '🔊 AI回答中...';
-
-                const url = URL.createObjectURL(blob);
-                currentAudio = new Audio(url);
-                
-                currentAudio.onended = () => {
-                    isPlaying = false;
-                    processAudioQueue(); 
-                    if (audioQueue.length === 0) {
-                        isAISpeaking = false;
-                        statusDiv.textContent = '🟢 完了。次の質問をどうぞ。';
-                    }
-                };
-                
-                currentAudio.onerror = (e) => {
-                    console.error("再生エラー", e);
-                    isPlaying = false;
-                    processAudioQueue();
-                };
-
-                currentAudio.play().catch(e => {
-                    console.error("再生開始失敗(Autoplay制限?):", e);
-                    isPlaying = false;
-                    processAudioQueue();
-                });
-            }
-
-            // --- その他ユーティリティ ---
+            // --- その他 ---
             function sendAudioAsWav(float32Array) {
                 const wavBuffer = encodeWAV(float32Array, 16000); 
                 ws.send(wavBuffer);
             }
-
             function stopVAD() {
                 vad?.destroy(); 
                 vad = null;
@@ -546,9 +530,7 @@ async def get_root():
                 startButton.disabled = false;
                 stopButton.disabled = true;
                 statusDiv.textContent = '停止中';
-                vadStatusDiv.textContent = '';
             }
-
             function encodeWAV(samples, sampleRate) {
                 const buffer = new ArrayBuffer(44 + samples.length * 2);
                 const view = new DataView(buffer);
@@ -581,10 +563,10 @@ async def get_root():
                 }
             }
 
-            // ★修正: マイクONクリック時に「音声ロック解除」と「VAD開始」を順次実行
+            // ★ボタンクリックでAudioContext初期化とVAD起動を同時に行う
             startButton.onclick = async () => {
-                unlockAudioContext(); // 先にロック解除
-                await setupVAD();     // 次にマイク起動
+                await initAudioContext(); // オーディオエンジンの起動
+                await setupVAD();         // マイクの起動
             };
             
             stopButton.onclick = stopVAD;

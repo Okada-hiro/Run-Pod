@@ -14,7 +14,7 @@ import io
 import re
 
 
-speaker_guard = SpeakerGuard()
+
 
 # --- ロギング設定 ---
 logging.basicConfig(
@@ -37,6 +37,7 @@ try:
 except ImportError as e:
     print(f"[ERROR] 必要なモジュールが見つかりません: {e}")
 from speaker_filter import SpeakerGuard
+speaker_guard = SpeakerGuard()
 # --- 設定 ---
 PROCESSING_DIR = "incoming_audio" 
 LANGUAGE = "ja"

@@ -1,7 +1,7 @@
-# /workspace/new_main.py
+# /workspace/new_new_main.py (修正版: バージイン対応)
 import uvicorn
 from fastapi import FastAPI, WebSocket, Request
-from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.websockets import WebSocketDisconnect
 import os
@@ -28,14 +28,11 @@ try:
     try:
         from supporter_generator import generate_answer_stream
     except ImportError:
-        # ファイル名が違う場合のバックアップ
         from new_answer_generator import generate_answer_stream
 
     from new_text_to_speech import synthesize_speech
 except ImportError as e:
     print(f"[ERROR] 必要なモジュールが見つかりません: {e}")
-    # 動作確認のため、インポートエラーでも起動だけはするようにexitはコメントアウトしています
-    # exit(1)
 
 # --- 設定 ---
 PROCESSING_DIR = "incoming_audio" 
@@ -89,14 +86,12 @@ async def process_sentence(text: str, base_filename: str, index: int, websocket:
 # ---------------------------
 # 2. バックグラウンド処理 (メインフロー)
 # ---------------------------
-# ★ chat_history を受け取るように変更
 async def process_audio_file(audio_path: str, original_filename: str, websocket: WebSocket, chat_history: list):
     logger.info(f"[TASK START] ファイル処理開始: {original_filename}")
     
     try:
         # --- 文字起こし ---
         output_txt_path = os.path.join(PROCESSING_DIR, original_filename + ".txt")
-        logger.info(f"[TASK] 文字起こし中...")
         
         question_text = await asyncio.to_thread(
             whisper_text_only,
@@ -111,14 +106,11 @@ async def process_audio_file(audio_path: str, original_filename: str, websocket:
         })
 
         # --- ストリーミング回答 & パイプライン処理 ---
-        logger.info(f"[TASK] ストリーミング処理開始...")
-
         text_buffer = ""
         sentence_count = 0
         full_answer_log = ""
         split_pattern = r'(?<=[。！？\n])'
 
-        # ★ 履歴(chat_history)を渡して生成
         iterator = generate_answer_stream(question_text, history=chat_history)
 
         for chunk_text in iterator:
@@ -129,7 +121,7 @@ async def process_audio_file(audio_path: str, original_filename: str, websocket:
             if full_answer_log.strip() == "[SILENCE]":
                 logger.info("[TASK] SILENCE検出。応答をスキップします。")
                 await websocket.send_json({"status": "ignored", "message": "（音声を無視しました）"})
-                return  # ★ 履歴に追加せずにここで終了
+                return
 
             # バッファ分割
             sentences = re.split(split_pattern, text_buffer)
@@ -149,7 +141,7 @@ async def process_audio_file(audio_path: str, original_filename: str, websocket:
             sentence_count += 1
             await process_sentence(text_buffer, original_filename, sentence_count, websocket)
         
-        # ★ 回答完了後に履歴を更新 (SILENCEでなければここに来る)
+        # 履歴更新
         chat_history.append({"role": "user", "parts": [question_text]})
         chat_history.append({"role": "model", "parts": [full_answer_log]})
         
@@ -171,7 +163,6 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     logger.info("[WS] クライアント接続")
     
-    # ★ 接続ごとに履歴を初期化
     chat_history = []
     
     try:
@@ -197,9 +188,9 @@ async def websocket_endpoint(websocket: WebSocket):
                 await websocket.send_json({"status": "error", "message": "音声形式エラー"})
                 continue
             
+            # 処理開始通知
             await websocket.send_json({"status": "processing", "message": "認識中..."})
 
-            # ★ chat_history を渡してタスク起動
             asyncio.create_task(process_audio_file(
                 output_wav_path, 
                 output_wav_filename, 
@@ -219,7 +210,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
 
 # ---------------------------
-# 4. フロントエンド (HTML/JS)
+# 4. フロントエンド (修正版 HTML/JS)
 # ---------------------------
 @app.get("/", response_class=HTMLResponse)
 async def get_root():
@@ -229,55 +220,60 @@ async def get_root():
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device.width, initial-scale=1.0">
-        <title>AI Voice Talk</title>
+        <title>AI Voice Talk (Barge-In)</title>
         
         <style>
-            body { font-family: sans-serif; display: grid; place-items: center; min-height: 90vh; background: #f4f4f4; }
-            #container { background: white; padding: 2rem; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); text-align: center; width: 90%; max-width: 600px; }
+            body { font-family: sans-serif; display: grid; place-items: center; min-height: 90vh; background: #f0f2f5; }
+            #container { background: white; padding: 2rem; border-radius: 12px; box-shadow: 0 8px 20px rgba(0,0,0,0.1); text-align: center; width: 90%; max-width: 600px; }
             
             button {
                 font-size: 1rem; padding: 0.8rem 1.5rem; border: none; 
-                border-radius: 5px; cursor: pointer; margin: 0.5rem; 
-                color: white; transition: opacity 0.2s;
+                border-radius: 25px; cursor: pointer; margin: 0.5rem; 
+                color: white; transition: transform 0.1s, opacity 0.2s;
+                font-weight: bold;
             }
-            button:disabled { background: #ccc !important; cursor: not-allowed; opacity: 0.6; }
+            button:active { transform: scale(0.98); }
+            button:disabled { background: #ccc !important; cursor: not-allowed; opacity: 0.6; transform: none; }
             
-            #startButton { background: #007bff; font-size: 1.2rem; }
+            #startButton { background: #007bff; }
             #stopButton { background: #6c757d; }
-            #interruptButton { background: #dc3545; display: inline-block; }
 
-            #status { margin-top: 1.5rem; font-size: 1.1rem; color: #333; min-height: 2em; font-weight: bold; }
-            #vad-status { font-size: 0.9rem; color: #666; height: 1.5em; }
+            #status { margin-top: 1.5rem; font-size: 1.1rem; color: #333; min-height: 1.5em; font-weight: bold; }
+            #vad-status { font-size: 0.9rem; color: #666; height: 1.5em; margin-bottom: 10px;}
             
-            #qa-display { margin: 1.5rem auto 0 auto; text-align: left; width: 100%; border-top: 1px solid #eee; padding-top: 1rem; }
-            #qa-display div { margin-bottom: 1rem; padding: 0.8rem; background: #f9f9f9; border-radius: 5px; white-space: pre-wrap; word-wrap: break-word; }
+            #qa-display { 
+                margin: 1rem auto 0 auto; text-align: left; width: 100%; 
+                border-top: 2px solid #f0f0f0; padding-top: 1rem; 
+                max-height: 400px; overflow-y: auto;
+            }
+            .bubble {
+                padding: 10px 15px; border-radius: 15px; margin-bottom: 10px;
+                line-height: 1.5; position: relative;
+            }
+            .user-bubble { background: #e7f5ff; color: #0056b3; margin-left: 20px; border-bottom-right-radius: 2px;}
+            .user-bubble::before { content: 'あなた'; font-size: 0.7rem; position: absolute; top: -18px; right: 0; color: #999; }
             
-            #question-text::before { content: '■ あなたの質問:'; font-weight: bold; display: block; margin-bottom: 0.3rem; color: #007bff;}
-            #answer-text::before { content: '■ AIの回答:'; font-weight: bold; display: block; margin-bottom: 0.3rem; color: #28a745;}
-            
-            #audioPlayback { margin-top: 1rem; }
+            .ai-bubble { background: #f0fff4; color: #155724; margin-right: 20px; border-bottom-left-radius: 2px;}
+            .ai-bubble::before { content: 'AI'; font-size: 0.7rem; position: absolute; top: -18px; left: 0; color: #999; }
+
+            #audioPlayback { margin-top: 1rem; display: none; }
         </style>
     </head>
     <body>
         <div id="container">
-            <h1>AI Voice Talk</h1>
-            <p>下のボタンを押してマイクを起動してください。</p>
+            <h1>AI Voice Talk ⚡</h1>
+            <p>いつでも話しかけてください（割り込み可能）</p>
             
             <div>
-                <button id="startButton">マイクを起動する</button>
-                <button id="stopButton" disabled>マイクを停止する</button>
-            </div>
-            <div>
-                <button id="interruptButton" disabled>■ 話をさえぎる</button>
+                <button id="startButton">マイクON</button>
+                <button id="stopButton" disabled>マイクOFF</button>
             </div>
             
             <div id="status">準備完了</div>
-            <div id="vad-status">(VAD待機中)</div>
+            <div id="vad-status">(待機中)</div>
             
             <div id="qa-display">
-                <div id="question-text"></div>
-                <div id="answer-text"></div>
-            </div>
+                </div>
 
             <div id="audioPlayback"></div>
         </div>
@@ -289,156 +285,267 @@ async def get_root():
             // --- DOM要素 ---
             const startButton = document.getElementById('startButton');
             const stopButton = document.getElementById('stopButton');
-            const interruptButton = document.getElementById('interruptButton'); 
             const statusDiv = document.getElementById('status');
             const vadStatusDiv = document.getElementById('vad-status');
+            const qaDisplay = document.getElementById('qa-display');
             const audioPlayback = document.getElementById('audioPlayback');
-            const questionTextDiv = document.getElementById('question-text');
-            const answerTextDiv = document.getElementById('answer-text');
 
             // --- グローバル変数 ---
             let ws;
             let vad; 
             let mediaStream; 
-            let isSpeaking = false; 
-            let isAISpeaking = false; 
             
-            let audioQueue = [];       
-            let isPlaying = false;     
-            let isServerDone = false;  
-            let currentAudio = null;   
-            let currentAudioUrl = null; 
+            // 状態管理フラグ
+            let isSpeaking = false;     // ユーザーが話しているか
+            let isAISpeaking = false;   // AIが喋っているか（再生中か）
+            
+            let audioQueue = [];        // 再生待ちの音声キュー
+            let isPlaying = false;      // 現在音声を再生中か
+            let currentAudio = null;    // 現在のAudioオブジェクト
+            
+            // バージイン制御用: 「前の回答」の残党を無視するためのフラグ
+            let ignoreIncomingAudio = false; 
+
+            // UI操作系
+            function appendBubble(role, text, id) {
+                let div = document.getElementById(id);
+                if (!div) {
+                    div = document.createElement('div');
+                    div.id = id;
+                    div.className = `bubble ${role === 'user' ? 'user-bubble' : 'ai-bubble'}`;
+                    qaDisplay.appendChild(div);
+                    qaDisplay.scrollTop = qaDisplay.scrollHeight;
+                }
+                div.textContent = text;
+                return div;
+            }
 
             function connectWebSocket() {
                 const wsProtocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
-                const wsUrl = wsProtocol + window.location.host + '/ws';
-                
-                ws = new WebSocket(wsUrl);
+                ws = new WebSocket(wsProtocol + window.location.host + '/ws');
                 ws.binaryType = 'arraybuffer';
 
                 ws.onopen = () => {
-                    console.log('WebSocket 接続成功');
-                    statusDiv.textContent = '準備完了。マイクを起動してください。';
+                    console.log('WebSocket 接続');
+                    statusDiv.textContent = '接続しました。マイクをONにしてください。';
                     startButton.disabled = false;
                 };
 
                 ws.onmessage = (event) => {
+                    // (A) 音声データ受信
                     if (event.data instanceof ArrayBuffer) {
-                        console.log(`音声受信: ${event.data.byteLength} bytes`);
+                        if (ignoreIncomingAudio) {
+                            console.log("割り込み済みのため、古い音声パケットを破棄");
+                            return;
+                        }
                         const audioBlob = new Blob([event.data], { type: 'audio/mp3' });
                         audioQueue.push(audioBlob);
                         processAudioQueue();
-                    } else {
+                    } 
+                    // (B) 制御メッセージ受信
+                    else {
                         try {
                             const data = JSON.parse(event.data);
                             handleJsonMessage(data);
-                        } catch (e) {
-                            console.error("JSONパースエラー", e);
-                        }
+                        } catch (e) { console.error(e); }
                     }
                 };
 
                 ws.onclose = () => {
-                    statusDiv.textContent = 'サーバー切断。リロードしてください。';
+                    statusDiv.textContent = 'サーバー切断。リロード推奨。';
                     stopVAD(); 
                 };
             }
 
+            // JSONメッセージハンドリング
+            let currentQuestionId = null;
+            let currentAnswerId = null;
+
             function handleJsonMessage(data) {
-                if (data.message) statusDiv.textContent = data.message;
-
                 if (data.status === 'processing') {
-                    questionTextDiv.textContent = '(聞き取っています...)';
-                    answerTextDiv.textContent = '';
-                    audioQueue = [];     
-                    isServerDone = false; 
-                    isPlaying = false;
-                    vad?.pause(); 
-
+                    // 新しいターン開始
+                    statusDiv.textContent = data.message;
+                    
+                    // ★ここ重要: 新しい処理が始まったので、以前の割り込みフラグは解除
+                    // ただし、AIが喋っている最中ならそれは「前のターン」なので止める必要があるが
+                    // processingが来る＝ユーザーが話し終わって送信した後なので、
+                    // 基本的にユーザー発話完了時点でinterruptAudioしてるはず。
+                    
                 } else if (data.status === 'transcribed') {
-                    questionTextDiv.textContent = data.question_text;
-                    answerTextDiv.textContent = '...'; 
+                    currentQuestionId = `q-${Date.now()}`;
+                    appendBubble('user', data.question_text, currentQuestionId);
+                    
+                    currentAnswerId = `a-${Date.now()}`;
+                    appendBubble('ai', '...', currentAnswerId);
 
                 } else if (data.status === 'reply_chunk') {
-                    if (answerTextDiv.textContent === '...') {
-                        answerTextDiv.textContent = '';
+                    if (ignoreIncomingAudio) return; // 無視モードならテキストも更新しない
+                    
+                    const div = document.getElementById(currentAnswerId);
+                    if (div) {
+                        if (div.textContent === '...') div.textContent = '';
+                        div.textContent += data.text_chunk;
+                        qaDisplay.scrollTop = qaDisplay.scrollHeight;
                     }
-                    answerTextDiv.textContent += data.text_chunk;
 
                 } else if (data.status === 'ignored') {
-                    // ★ 無視された場合の処理を追加
-                    console.log("サーバーにより無視されました");
-                    answerTextDiv.textContent = "(応答なし)";
-                    isServerDone = true;
-                    finishPlayback(); 
-
-                } else if (data.status === 'complete') {
-                    console.log("サーバー生成完了");
-                    isServerDone = true;
-                    if (!isPlaying && audioQueue.length === 0) {
-                        finishPlayback();
+                    statusDiv.textContent = "（音声を無視しました）";
+                    if (currentAnswerId) {
+                         const div = document.getElementById(currentAnswerId);
+                         if(div) div.textContent = "(応答なし)";
                     }
-                    
+
                 } else if (data.status === 'error') {
-                    answerTextDiv.textContent = `エラー: ${data.message}`;
-                    finishPlayback(); 
+                    statusDiv.textContent = `エラー: ${data.message}`;
                 }
             }
 
+            // --- VAD & マイク設定 (Barge-Inの中核) ---
             async function setupVAD() {
                 try {
+                    startButton.disabled = true;
+                    statusDiv.textContent = 'VAD準備中...';
+
                     while (!window.vad) await new Promise(r => setTimeout(r, 50));
-                    mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                    
+                    // ★重要1: エコーキャンセルを有効にする
+                    mediaStream = await navigator.mediaDevices.getUserMedia({ 
+                        audio: {
+                            echoCancellation: true,
+                            noiseSuppression: true,
+                            autoGainControl: true
+                        } 
+                    });
                     
                     vad = await window.vad.MicVAD.new({
-                        stream: mediaStream, 
-                        onnxWASMBasePath: "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/",
-                        baseAssetPath: "https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.29/dist/",
+                        stream: mediaStream,
                         positiveSpeechThreshold: 0.8,
-                        negativeSpeechThreshold: 0.8,
                         minSpeechFrames: 2,
                         preSpeechPadFrames: 20,
-                        redemptionFrames: 30,
                         
+                        // ★重要2: 話し始めの検知 (割り込みトリガー)
                         onSpeechStart: () => {
-                            if (isAISpeaking) return; 
                             isSpeaking = true;
-                            vadStatusDiv.textContent = "発話中...";
+                            vadStatusDiv.textContent = "🗣️ 感知中...";
+                            
+                            // もしAIが喋っていたり、再生待ちがある場合は「割り込み」とみなす
+                            if (isPlaying || audioQueue.length > 0) {
+                                console.log("⚡ 割り込み発生！ AIの音声を停止します");
+                                interruptAudio();
+                            }
                         },
                         
+                        // ★重要3: 話し終わりの検知
                         onSpeechEnd: (audio) => {
-                            if (isAISpeaking) return;
                             isSpeaking = false;
-                            vadStatusDiv.textContent = "送信中...";
+                            vadStatusDiv.textContent = "📡 送信中...";
                             
+                            // サーバーへ送信
                             if (ws && ws.readyState === WebSocket.OPEN) {
+                                // 次のAI回答を受け入れる準備
+                                ignoreIncomingAudio = false; 
                                 sendAudioAsWav(audio);
-                                statusDiv.textContent = '音声を送信中...';
-                                vad?.pause(); 
+                                statusDiv.textContent = 'AI思考中...';
                             }
+                            
+                            // ★以前あった vad.pause() は削除。常に聞き耳を立てる。
                         }
                     });
 
                     vad.start();
-                    startButton.disabled = true;
                     stopButton.disabled = false;
-                    interruptButton.disabled = true;
-                    statusDiv.textContent = 'マイク起動完了。話しかけてください。';
-                    vadStatusDiv.textContent = '待機中...';
+                    statusDiv.textContent = '🟢 準備完了。いつでも話しかけてください。';
+                    vadStatusDiv.textContent = '👂 待機中';
 
                 } catch (err) {
                     console.error('VADエラー:', err);
-                    statusDiv.textContent = 'VAD初期化失敗';
+                    statusDiv.textContent = 'マイク初期化エラー。';
+                    startButton.disabled = false;
                 }
             }
 
-            function sendAudioAsWav(float32Array) {
-                const wavBuffer = encodeWAV(float32Array, 16000); 
-                const blob = new Blob([wavBuffer], { type: 'audio/wav' });
-                ws.send(blob);
+            // --- 割り込み処理関数 ---
+            function interruptAudio() {
+                // 1. 再生中の音声を止める
+                if (currentAudio) {
+                    currentAudio.pause();
+                    currentAudio = null;
+                }
+                
+                // 2. 再生待ちキューを空にする
+                audioQueue = [];
+                isPlaying = false;
+                isAISpeaking = false;
+                
+                // 3. これから届く「古い回答の続き」を無視するフラグを立てる
+                ignoreIncomingAudio = true;
+                
+                statusDiv.textContent = '⛔ 中断しました。あなたの声を聞いています。';
+                
+                // UI上のフィードバック（オプション）
+                if (currentAnswerId) {
+                    const div = document.getElementById(currentAnswerId);
+                    if (div) div.textContent += " (中断)";
+                }
             }
 
-            // --- WAVエンコード関数 (いただいた元のコードを維持) ---
+            // --- 音声再生ロジック ---
+            function processAudioQueue() {
+                if (isPlaying) return;
+                if (audioQueue.length === 0) return;
+                
+                const nextBlob = audioQueue.shift();
+                playAudioBlob(nextBlob);
+            }
+
+            function playAudioBlob(blob) {
+                isPlaying = true;
+                isAISpeaking = true; // AI発話中フラグ
+                statusDiv.textContent = '🔊 AI回答中...';
+
+                const url = URL.createObjectURL(blob);
+                currentAudio = new Audio(url);
+                
+                currentAudio.onended = () => {
+                    isPlaying = false;
+                    processAudioQueue(); // 次の文へ
+                    
+                    // 全部終わったら
+                    if (audioQueue.length === 0) {
+                        isAISpeaking = false;
+                        statusDiv.textContent = '🟢 完了。次の質問をどうぞ。';
+                    }
+                };
+                
+                // エラーハンドリング
+                currentAudio.onerror = () => {
+                    isPlaying = false;
+                    processAudioQueue();
+                };
+
+                currentAudio.play().catch(e => {
+                    console.error("再生エラー:", e);
+                    isPlaying = false;
+                    processAudioQueue();
+                });
+            }
+
+            // --- その他ユーティリティ ---
+            function sendAudioAsWav(float32Array) {
+                const wavBuffer = encodeWAV(float32Array, 16000); 
+                ws.send(wavBuffer);
+            }
+
+            function stopVAD() {
+                vad?.destroy(); 
+                vad = null;
+                mediaStream?.getTracks().forEach(track => track.stop());
+                startButton.disabled = false;
+                stopButton.disabled = true;
+                statusDiv.textContent = '停止中';
+                vadStatusDiv.textContent = '';
+            }
+
             function encodeWAV(samples, sampleRate) {
                 const buffer = new ArrayBuffer(44 + samples.length * 2);
                 const view = new DataView(buffer);
@@ -458,13 +565,11 @@ async def get_root():
                 floatTo16BitPCM(view, 44, samples);
                 return view;
             }
-
             function writeString(view, offset, string) {
                 for (let i = 0; i < string.length; i++) {
                     view.setUint8(offset + i, string.charCodeAt(i));
                 }
             }
-
             function floatTo16BitPCM(output, offset, input) {
                 for (let i = 0; i < input.length; i++, offset += 2) {
                     let s = Math.max(-1, Math.min(1, input[i]));
@@ -473,96 +578,9 @@ async def get_root():
                 }
             }
 
-            function stopVAD() {
-                vad?.destroy(); 
-                vad = null;
-                mediaStream?.getTracks().forEach(track => track.stop());
-                isSpeaking = false;
-                startButton.disabled = false;
-                stopButton.disabled = true;
-                interruptButton.disabled = true;
-                statusDiv.textContent = '停止しました。';
-            }
-            
-            function processAudioQueue() {
-                if (isPlaying) return;
-                if (audioQueue.length === 0) {
-                    if (isServerDone) finishPlayback();
-                    return;
-                }
-                const nextBlob = audioQueue.shift();
-                playAudioBlob(nextBlob);
-            }
-
-            function playAudioBlob(blob) {
-                isPlaying = true;
-                isAISpeaking = true;
-                vad?.pause();
-                statusDiv.textContent = 'AI回答中...';
-                interruptButton.disabled = false;
-
-                if (currentAudioUrl) URL.revokeObjectURL(currentAudioUrl);
-                currentAudioUrl = URL.createObjectURL(blob);
-                
-                if (currentAudio) {
-                    currentAudio.pause();
-                    currentAudio.onended = null;
-                }
-
-                audioPlayback.innerHTML = ''; 
-                currentAudio = new Audio(currentAudioUrl);
-                currentAudio.controls = true;
-                currentAudio.autoplay = true;
-
-                currentAudio.onended = () => {
-                    console.log("断片再生完了");
-                    isPlaying = false;
-                    processAudioQueue();
-                };
-                
-                currentAudio.onerror = (e) => {
-                    console.error("再生エラー", e);
-                    isPlaying = false;
-                    processAudioQueue();
-                }
-
-                audioPlayback.appendChild(currentAudio);
-            }
-
-            function finishPlayback() {
-                console.log("全完了。待機モードへ");
-                isAISpeaking = false;
-                isPlaying = false;
-                isServerDone = false;
-                audioQueue = []; 
-                interruptButton.disabled = true; 
-
-                if (currentAudio) {
-                    currentAudio.pause();
-                    currentAudio = null;
-                }
-                
-                vad?.start(); 
-                statusDiv.textContent = '待機中... 話しかけてください。';
-                vadStatusDiv.textContent = '待機中...';
-            }
-
-            function interruptAudio() {
-                console.log("中断");
-                audioQueue = []; 
-                isServerDone = true; 
-                finishPlayback();
-                statusDiv.textContent = '中断しました。';
-            }
-
             startButton.onclick = setupVAD;
             stopButton.onclick = stopVAD;
-            interruptButton.onclick = interruptAudio; 
-
-            window.onload = () => {
-                startButton.disabled = true;
-                connectWebSocket();
-            };
+            window.onload = connectWebSocket;
         </script>
     </body>
     </html>

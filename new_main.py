@@ -1,4 +1,5 @@
 # /workspace/main.py
+#一定の速さを誇る汎用chatbot
 import uvicorn
 from fastapi import FastAPI, WebSocket, Request
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse

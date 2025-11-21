@@ -51,8 +51,8 @@ class FasterWhisperASR(ASRBase):
         # (L.125)
         model = WhisperModel(model_size_or_path, device="cuda", compute_type="float16", download_root=cache_dir)
         return model
-
-    def transcribe(self, audio, init_prompt=""):
+    init_prompt = "保険、生命保険、医療保険、火災保険、契約、年齢、月額、保障、給付金、特約、解約返戻金、入院、手術、男性、女性、リスク、見積もり"
+    def transcribe(self, audio, init_prompt=init_prompt):
         # (L.141)
         segments, info = self.model.transcribe(
             audio, 

@@ -1,4 +1,4 @@
-# /workspace/new_new_main.py (修正版: バージイン対応)
+# /workspace/new_new_main.py (修正版: バージイン対応 + 404エラー修正)
 import uvicorn
 from fastapi import FastAPI, WebSocket, Request
 from fastapi.responses import HTMLResponse
@@ -366,11 +366,6 @@ async def get_root():
                     // 新しいターン開始
                     statusDiv.textContent = data.message;
                     
-                    // ★ここ重要: 新しい処理が始まったので、以前の割り込みフラグは解除
-                    // ただし、AIが喋っている最中ならそれは「前のターン」なので止める必要があるが
-                    // processingが来る＝ユーザーが話し終わって送信した後なので、
-                    // 基本的にユーザー発話完了時点でinterruptAudioしてるはず。
-                    
                 } else if (data.status === 'transcribed') {
                     currentQuestionId = `q-${Date.now()}`;
                     appendBubble('user', data.question_text, currentQuestionId);
@@ -422,6 +417,9 @@ async def get_root():
                         positiveSpeechThreshold: 0.8,
                         minSpeechFrames: 2,
                         preSpeechPadFrames: 20,
+                        // ★追加: CDNからモデルを読み込む設定
+                        onnxWASMBasePath: "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/",
+                        baseAssetPath: "https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.29/dist/",
                         
                         // ★重要2: 話し始めの検知 (割り込みトリガー)
                         onSpeechStart: () => {
@@ -447,8 +445,6 @@ async def get_root():
                                 sendAudioAsWav(audio);
                                 statusDiv.textContent = 'AI思考中...';
                             }
-                            
-                            // ★以前あった vad.pause() は削除。常に聞き耳を立てる。
                         }
                     });
 

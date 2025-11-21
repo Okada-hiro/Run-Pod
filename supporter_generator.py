@@ -1,4 +1,4 @@
-# /workspace/supporter_generator.py
+# /workspace/supporter_generator.py (修正版)
 
 import google.generativeai as genai
 import os
@@ -50,14 +50,14 @@ User: "（横の人に）ねえ、これ意外と高いよね"
 AI: [SILENCE]
 """
 
-# 確実に動作するモデル名を使用
-DEFAULT_MODEL = "gemini-2.5-flash-lite"
+# モデル名 (確実に動作するもの)
+DEFAULT_MODEL = "gemini-1.5-flash"
 
 def generate_answer_stream(question: str, model=DEFAULT_MODEL, history: list = None):
     """
     回答をストリーミング(ジェネレータ)として返す
     """
-    # 履歴がない場合は空リストを作成
+    # 履歴がNoneなら空リストで初期化
     if history is None:
         history = []
         
@@ -78,19 +78,23 @@ def generate_answer_stream(question: str, model=DEFAULT_MODEL, history: list = N
                 generation_config={"temperature": 0.2}
             )
             
-            # ★ 会話履歴を渡してチャットを開始
+            # 会話履歴を引き継ぐ
             chat_session = model_instance.start_chat(history=history)
             
-            # ★ ストリーミング送信 (stream=True)
+            # ストリーミングリクエスト
             response = chat_session.send_message(question, stream=True)
             
-            # ★ エラー修正の要: 
-            # ここで response.text にアクセスしてはいけません。
-            # 直接ループで回してチャンクを取得します。
-            
+            # ★★★ エラー対策の修正箇所 ★★★
             for chunk in response:
-                if chunk.text:
-                    yield chunk.text
+                try:
+                    # chunk.text にアクセスしてみて、中身があれば yield する
+                    text_part = chunk.text
+                    if text_part:
+                        yield text_part
+                except ValueError:
+                    # 「終了合図」などの空データが来た場合、ValueErrorが出るので無視して次へ
+                    continue
+
         else:
             yield f"対応していないモデル名です: {model}"
 
@@ -98,11 +102,15 @@ def generate_answer_stream(question: str, model=DEFAULT_MODEL, history: list = N
         print(f"[ERROR] ストリーミング生成エラー: {e}")
         yield "申し訳ありません、エラーが発生しました。"
 
+
 # --- 単体テスト ---
 if __name__ == "__main__":
     print("--- テスト実行 ---")
     if GOOGLE_API_KEY:
+        # 空の履歴でテスト
         iterator = generate_answer_stream("こんにちは", history=[])
         for text in iterator:
             print(text, end="", flush=True)
         print("\n")
+    else:
+        print("APIキーがありません")

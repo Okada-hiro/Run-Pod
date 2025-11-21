@@ -1,4 +1,5 @@
-# /workspace/new_new_main.py (完全修正版: Web Audio API対応)
+# /workspace/new_new_main.py 
+#速いし、字幕の履歴も出すし、履歴を参照するし、誤字脱字を修正する
 import uvicorn
 from fastapi import FastAPI, WebSocket, Request
 from fastapi.responses import HTMLResponse, FileResponse
@@ -12,8 +13,6 @@ import sys
 from pydub import AudioSegment
 import io
 import re
-from speaker_filter import SpeakerGuard
-speaker_guard = SpeakerGuard()
 
 # --- ロギング設定 ---
 logging.basicConfig(
@@ -97,15 +96,7 @@ async def process_sentence(text: str, base_filename: str, index: int, websocket:
 # ---------------------------
 async def process_audio_file(audio_path: str, original_filename: str, websocket: WebSocket, chat_history: list):
     logger.info(f"[TASK START] ファイル処理開始: {original_filename}")
-    # ★★★ ここに追加: 話者判定 ★★★
-    # 本人じゃなければ即終了 (WhisperもLLMも回さない)
-    is_owner = await asyncio.to_thread(speaker_guard.is_owner, audio_path)
     
-    if not is_owner:
-        logger.info("[TASK] 他人の声のため無視しました")
-        await websocket.send_json({"status": "ignored", "message": "（他人の声を無視）"})
-        return 
-    # ★★★ ここまで ★★★
     try:
         # --- 文字起こし ---
         output_txt_path = os.path.join(PROCESSING_DIR, original_filename + ".txt")

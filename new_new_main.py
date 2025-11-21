@@ -1,7 +1,7 @@
-# /workspace/new_new_main.py (修正版: バージイン対応 + 404エラー修正)
+# /workspace/new_new_main.py (完全修正版)
 import uvicorn
 from fastapi import FastAPI, WebSocket, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.websockets import WebSocketDisconnect
 import os
@@ -71,8 +71,15 @@ async def process_sentence(text: str, base_filename: str, index: int, websocket:
     
     if success:
         try:
-            # (C) WAV -> MP3
+            # (C) 音声チェックと変換
             audio_segment = AudioSegment.from_wav(part_path_abs)
+            duration_sec = len(audio_segment) / 1000.0
+            
+            if duration_sec < 0.1:
+                logger.warning(f"⚠️ [AUDIO WARNING] 生成音声が短すぎます: {duration_sec}秒")
+            else:
+                logger.info(f"🔊 [AUDIO OK] 文{index} 長さ: {duration_sec}秒")
+
             mp3_buffer = io.BytesIO()
             audio_segment.export(mp3_buffer, format="mp3", bitrate="128k")
             audio_data = mp3_buffer.getvalue()
@@ -295,13 +302,11 @@ async def get_root():
             let vad; 
             let mediaStream; 
             
-            // 状態管理フラグ
-            let isSpeaking = false;     // ユーザーが話しているか
-            let isAISpeaking = false;   // AIが喋っているか（再生中か）
-            
-            let audioQueue = [];        // 再生待ちの音声キュー
-            let isPlaying = false;      // 現在音声を再生中か
-            let currentAudio = null;    // 現在のAudioオブジェクト
+            let isSpeaking = false;     
+            let isAISpeaking = false;   
+            let audioQueue = [];        
+            let isPlaying = false;      
+            let currentAudio = null;    
             
             // バージイン制御用: 「前の回答」の残党を無視するためのフラグ
             let ignoreIncomingAudio = false; 
@@ -363,7 +368,6 @@ async def get_root():
 
             function handleJsonMessage(data) {
                 if (data.status === 'processing') {
-                    // 新しいターン開始
                     statusDiv.textContent = data.message;
                     
                 } else if (data.status === 'transcribed') {
@@ -374,7 +378,7 @@ async def get_root():
                     appendBubble('ai', '...', currentAnswerId);
 
                 } else if (data.status === 'reply_chunk') {
-                    if (ignoreIncomingAudio) return; // 無視モードならテキストも更新しない
+                    if (ignoreIncomingAudio) return; 
                     
                     const div = document.getElementById(currentAnswerId);
                     if (div) {
@@ -395,7 +399,22 @@ async def get_root():
                 }
             }
 
-            // --- VAD & マイク設定 (Barge-Inの中核) ---
+            // --- ★重要: Autoplayポリシー回避のためのハック ---
+            function unlockAudioContext() {
+                const ctx = new (window.AudioContext || window.webkitAudioContext)();
+                const buffer = ctx.createBuffer(1, 1, 22050); 
+                const source = ctx.createBufferSource();
+                source.buffer = buffer;
+                source.connect(ctx.destination);
+                
+                // 一瞬再生
+                if (source.start) source.start(0);
+                else if (source.noteOn) source.noteOn(0);
+                
+                console.log("🔓 AudioContext unlocked.");
+            }
+
+            // --- VAD & マイク設定 ---
             async function setupVAD() {
                 try {
                     startButton.disabled = true;
@@ -403,7 +422,7 @@ async def get_root():
 
                     while (!window.vad) await new Promise(r => setTimeout(r, 50));
                     
-                    // ★重要1: エコーキャンセルを有効にする
+                    // エコーキャンセルを有効にする
                     mediaStream = await navigator.mediaDevices.getUserMedia({ 
                         audio: {
                             echoCancellation: true,
@@ -414,33 +433,30 @@ async def get_root():
                     
                     vad = await window.vad.MicVAD.new({
                         stream: mediaStream,
-                        positiveSpeechThreshold: 0.8,
-                        minSpeechFrames: 2,
+                        // 感度調整: 0.9 で自爆(エコー)を減らす
+                        positiveSpeechThreshold: 0.9, 
+                        minSpeechFrames: 4, 
                         preSpeechPadFrames: 20,
-                        // ★追加: CDNからモデルを読み込む設定
+                        // ★CDN修正
                         onnxWASMBasePath: "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/",
                         baseAssetPath: "https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.29/dist/",
                         
-                        // ★重要2: 話し始めの検知 (割り込みトリガー)
                         onSpeechStart: () => {
                             isSpeaking = true;
                             vadStatusDiv.textContent = "🗣️ 感知中...";
                             
-                            // もしAIが喋っていたり、再生待ちがある場合は「割り込み」とみなす
+                            // 割り込み処理
                             if (isPlaying || audioQueue.length > 0) {
                                 console.log("⚡ 割り込み発生！ AIの音声を停止します");
                                 interruptAudio();
                             }
                         },
                         
-                        // ★重要3: 話し終わりの検知
                         onSpeechEnd: (audio) => {
                             isSpeaking = false;
                             vadStatusDiv.textContent = "📡 送信中...";
                             
-                            // サーバーへ送信
                             if (ws && ws.readyState === WebSocket.OPEN) {
-                                // 次のAI回答を受け入れる準備
                                 ignoreIncomingAudio = false; 
                                 sendAudioAsWav(audio);
                                 statusDiv.textContent = 'AI思考中...';
@@ -462,23 +478,16 @@ async def get_root():
 
             // --- 割り込み処理関数 ---
             function interruptAudio() {
-                // 1. 再生中の音声を止める
                 if (currentAudio) {
                     currentAudio.pause();
                     currentAudio = null;
                 }
-                
-                // 2. 再生待ちキューを空にする
                 audioQueue = [];
                 isPlaying = false;
                 isAISpeaking = false;
-                
-                // 3. これから届く「古い回答の続き」を無視するフラグを立てる
                 ignoreIncomingAudio = true;
-                
                 statusDiv.textContent = '⛔ 中断しました。あなたの声を聞いています。';
                 
-                // UI上のフィードバック（オプション）
                 if (currentAnswerId) {
                     const div = document.getElementById(currentAnswerId);
                     if (div) div.textContent += " (中断)";
@@ -496,7 +505,7 @@ async def get_root():
 
             function playAudioBlob(blob) {
                 isPlaying = true;
-                isAISpeaking = true; // AI発話中フラグ
+                isAISpeaking = true; 
                 statusDiv.textContent = '🔊 AI回答中...';
 
                 const url = URL.createObjectURL(blob);
@@ -504,23 +513,21 @@ async def get_root():
                 
                 currentAudio.onended = () => {
                     isPlaying = false;
-                    processAudioQueue(); // 次の文へ
-                    
-                    // 全部終わったら
+                    processAudioQueue(); 
                     if (audioQueue.length === 0) {
                         isAISpeaking = false;
                         statusDiv.textContent = '🟢 完了。次の質問をどうぞ。';
                     }
                 };
                 
-                // エラーハンドリング
-                currentAudio.onerror = () => {
+                currentAudio.onerror = (e) => {
+                    console.error("再生エラー", e);
                     isPlaying = false;
                     processAudioQueue();
                 };
 
                 currentAudio.play().catch(e => {
-                    console.error("再生エラー:", e);
+                    console.error("再生開始失敗(Autoplay制限?):", e);
                     isPlaying = false;
                     processAudioQueue();
                 });
@@ -574,7 +581,12 @@ async def get_root():
                 }
             }
 
-            startButton.onclick = setupVAD;
+            // ★修正: マイクONクリック時に「音声ロック解除」と「VAD開始」を順次実行
+            startButton.onclick = async () => {
+                unlockAudioContext(); // 先にロック解除
+                await setupVAD();     // 次にマイク起動
+            };
+            
             stopButton.onclick = stopVAD;
             window.onload = connectWebSocket;
         </script>

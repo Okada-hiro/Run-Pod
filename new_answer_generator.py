@@ -89,8 +89,8 @@ def generate_answer_stream(question: str, model="gemini-2.5-flash-lite"):
                 model_name=model,
                 system_instruction=system_prompt
             )
-            # ★ stream=True に設定
-            response = model_instance.generate_content(question, stream=True)
+            # ★ stream=False に設定
+            response = model_instance.generate_content(question, stream=False)
             
             for chunk in response:
                 if chunk.text:

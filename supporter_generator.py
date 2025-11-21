@@ -111,7 +111,7 @@ def generate_answer(question: str, model=DEFAULT_MODEL, history: list = None) ->
     return answer
 
 # ★ モデル名を修正
-def generate_answer_stream(question: str, model="gemini-2.5-flash-lite"):
+def generate_answer_stream(question: str, model="gemini-2.5-flash-lite", history: list = None):
     """
     回答をストリーミング(ジェネレータ)として返す
     """
@@ -131,8 +131,12 @@ def generate_answer_stream(question: str, model="gemini-2.5-flash-lite"):
                 system_instruction=SYSTEM_PROMPT
             )
             
-            response = model_instance.generate_content(question, stream=True)
+            # ★ ここを変更: start_chat で履歴付きセッションを開始
+            chat_session = model_instance.start_chat(history=history)
             
+            # 履歴を踏まえてメッセージを送信
+            response = chat_session.send_message(question, stream=True)
+            answer = response.text.strip()
             for chunk in response:
                 if chunk.text:
                     yield chunk.text

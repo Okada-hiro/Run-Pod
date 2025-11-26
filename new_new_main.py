@@ -425,6 +425,13 @@ async def get_root():
                     }
                 } else if (data.status === 'ignored') {
                     statusDiv.textContent = data.message;
+                    
+                    // ★改善: 3秒後に表示を「待機中」に戻すタイマーをセット
+                    setTimeout(() => {
+                        if (statusDiv.textContent === data.message) {
+                             statusDiv.textContent = '🟢 準備完了 (次の会話どうぞ)';
+                        }
+                    }, 1000);
                     // 必要ならバブルにも表示
                     if (currentAnswerId) {
                          const div = document.getElementById(currentAnswerId);

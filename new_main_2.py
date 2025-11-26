@@ -206,66 +206,55 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     logger.info("[WS] Client Connected. Starting VAD Stream.")
     
-    # VADイテレータの初期化
     vad_iterator = VADIterator(vad_model)
-    
-    # 会話用バッファ
     audio_buffer = [] 
     is_speaking = False
     
-    # Silero VAD 定数 (16kHz)
     WINDOW_SIZE_SAMPLES = 512 
     SAMPLE_RATE = 16000
-
     chat_history = []
 
     try:
         while True:
-            # 1. クライアントから受信 (4096サンプル)
             data_bytes = await websocket.receive_bytes()
-            
-            # Warning対策: .copy() で書き込み可能にする
             audio_chunk_np = np.frombuffer(data_bytes, dtype=np.float32).copy()
             
-            # 2. 512サンプルずつに分割して処理
             offset = 0
             while offset + WINDOW_SIZE_SAMPLES <= len(audio_chunk_np):
-                # 切り出し (512サンプル)
                 window_np = audio_chunk_np[offset : offset + WINDOW_SIZE_SAMPLES]
                 offset += WINDOW_SIZE_SAMPLES
                 
-                # ★修正: .unsqueeze(0) を追加して (1, 512) の形状にする
-                # torch.from_numpy(window_np) -> (512,)
-                # .unsqueeze(0) -> (1, 512)
                 window_tensor = torch.from_numpy(window_np).unsqueeze(0).to(DEVICE)
 
                 # --- VAD 判定 ---
                 speech_dict = await asyncio.to_thread(vad_iterator, window_tensor, return_seconds=True)
                 
-                if "start" in speech_dict:
-                    logger.info("🗣️ [VAD] Speech STARTED")
-                    is_speaking = True
-                    await websocket.send_json({"status": "processing", "message": "聞いています..."})
-                    audio_buffer = [window_np] 
+                # ★修正: speech_dict が None でないか確認する
+                if speech_dict:
+                    if "start" in speech_dict:
+                        logger.info("🗣️ [VAD] Speech STARTED")
+                        is_speaking = True
+                        await websocket.send_json({"status": "processing", "message": "聞いています..."})
+                        audio_buffer = [window_np] 
+                    
+                    elif "end" in speech_dict:
+                        logger.info("🤫 [VAD] Speech ENDED")
+                        if is_speaking:
+                            is_speaking = False
+                            audio_buffer.append(window_np)
+                            
+                            full_audio = np.concatenate(audio_buffer)
+                            if len(full_audio) / SAMPLE_RATE < 0.2:
+                                logger.info("Noise detected (too short), ignoring.")
+                            else:
+                                await process_voice_pipeline(full_audio, websocket, chat_history)
+                            audio_buffer = [] 
                 
-                elif "end" in speech_dict:
-                    logger.info("🤫 [VAD] Speech ENDED")
+                else:
+                    # speech_dict が None (イベントなし) の場合
+                    # 話している最中ならバッファに追加し続ける
                     if is_speaking:
-                        is_speaking = False
                         audio_buffer.append(window_np)
-                        
-                        full_audio = np.concatenate(audio_buffer)
-                        
-                        # ノイズ除去 (0.2秒未満は無視)
-                        if len(full_audio) / SAMPLE_RATE < 0.2:
-                            logger.info("Noise detected (too short), ignoring.")
-                        else:
-                            await process_voice_pipeline(full_audio, websocket, chat_history)
-                        
-                        audio_buffer = [] 
-                
-                elif is_speaking:
-                    audio_buffer.append(window_np)
 
     except WebSocketDisconnect:
         logger.info("[WS] Disconnected")

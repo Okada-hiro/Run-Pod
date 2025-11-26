@@ -500,6 +500,11 @@ async def get_root():
                         stream: mediaStream,
                         positiveSpeechThreshold: 0.9, // 誤検知防止で少し高め
                         minSpeechFrames: 4,
+                        // 【重要】話し終わりの余韻 (ここを短くするとレスポンスが早くなる)
+                        // デフォルトはもう少し長いですが、ここを減らすと「話し終わり」を即断します。
+                        // 1フレーム ≈ 30ms～96ms (モデルによる)。
+                        // 8フレーム程度に設定すると、一呼吸置いた瞬間に送信されます。
+                        redemptionFrames: 8,
                         preSpeechPadFrames: 20,
                         onnxWASMBasePath: "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/",
                         baseAssetPath: "https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.29/dist/",

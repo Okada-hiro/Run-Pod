@@ -121,7 +121,7 @@ async def process_voice_pipeline(audio_float32_np, websocket: WebSocket, chat_hi
         )
         
         # テキスト結合
-        text = "".join([s.word for s in GLOBAL_ASR_MODEL_INSTANCE.ts_words(segments)])
+        text = "".join([s[2] for s in GLOBAL_ASR_MODEL_INSTANCE.ts_words(segments)])
         
         if not text.strip():
             logger.info("[TASK] 音声認識結果が空でした")

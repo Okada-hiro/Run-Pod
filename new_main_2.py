@@ -1,5 +1,5 @@
 # /workspace/new_new_main.py
-# Server-Side VAD (Silero) + Streaming Architecture + Speaker Registration + UI Improvements
+# Server-Side VAD (Silero) + Streaming Architecture + Speaker Registration + Subtitles Fixed
 
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -82,7 +82,6 @@ async def process_voice_pipeline(audio_float32_np, websocket: WebSocket, chat_hi
     # 0. 話者登録モード
     # ---------------------------
     if NEXT_AUDIO_IS_REGISTRATION:
-        # ファイル経由で登録 (torchaudio互換性のため)
         temp_reg_path = f"{PROCESSING_DIR}/reg_{id(audio_float32_np)}.wav"
         import soundfile as sf
         sf.write(temp_reg_path, audio_float32_np, 16000)
@@ -99,7 +98,6 @@ async def process_voice_pipeline(audio_float32_np, websocket: WebSocket, chat_hi
     # ---------------------------
     # 1. 話者認識 (SpeakerGuard)
     # ---------------------------
-    # メモリ上のTensorで高速判定
     is_allowed = await asyncio.to_thread(speaker_guard.verify_tensor, voice_tensor)
 
     if not is_allowed:
@@ -120,7 +118,6 @@ async def process_voice_pipeline(audio_float32_np, websocket: WebSocket, chat_hi
             audio_float32_np
         )
         
-        # テキスト抽出
         text = "".join([s[2] for s in GLOBAL_ASR_MODEL_INSTANCE.ts_words(segments)])
         
         if not text.strip():
@@ -148,7 +145,6 @@ async def handle_llm_tts(text: str, websocket: WebSocket, chat_history: list):
     text_buffer = ""
     sentence_count = 0
     full_answer = ""
-    # 「、」も含めて細かく区切る（体感速度向上）
     split_pattern = r'(?<=[。！？\n、])'
 
     iterator = generate_answer_stream(text, history=chat_history)
@@ -176,7 +172,9 @@ async def handle_llm_tts(text: str, websocket: WebSocket, chat_history: list):
                 for sent in sentences[:-1]:
                     if sent.strip():
                         sentence_count += 1
+                        # ★ここで字幕（テキスト）を送信
                         await websocket.send_json({"status": "reply_chunk", "text_chunk": sent})
+                        # 音声送信
                         await send_audio_chunk(sent, sentence_count)
                 text_buffer = sentences[-1]
         
@@ -232,7 +230,6 @@ async def websocket_endpoint(websocket: WebSocket):
                     if "start" in speech_dict:
                         logger.info("🗣️ Speech START")
                         is_speaking = True
-                        # ★ UI更新: 聞いています
                         await websocket.send_json({"status": "processing", "message": "👂 聞いています..."})
                         audio_buffer = [window_np] 
                     
@@ -244,15 +241,11 @@ async def websocket_endpoint(websocket: WebSocket):
                             
                             full_audio = np.concatenate(audio_buffer)
                             
-                            # ノイズ判定
                             if len(full_audio) / SAMPLE_RATE < 0.2:
                                 logger.info("Noise detected (too short)")
                                 await websocket.send_json({"status": "ignored", "message": "..."})
                             else:
-                                # ★ UI更新: 処理開始フィードバック
                                 await websocket.send_json({"status": "processing", "message": "🧠 AI思考中..."})
-                                
-                                # パイプライン実行
                                 await process_voice_pipeline(full_audio, websocket, chat_history)
                             
                             audio_buffer = [] 
@@ -270,7 +263,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
 
 # ---------------------------
-# フロントエンド (話者登録 & UI改善版)
+# フロントエンド (字幕修正 & LINE風UI)
 # ---------------------------
 @app.get("/", response_class=HTMLResponse)
 async def get_root():
@@ -282,50 +275,62 @@ async def get_root():
         <meta name="viewport" content="width=device.width, initial-scale=1.0">
         <title>Realtime Voice Chat ⚡</title>
         <style>
-            body { font-family: sans-serif; display: grid; place-items: center; min-height: 90vh; background: #222; color: #fff; margin: 0; }
-            #container { background: #333; padding: 2rem; border-radius: 12px; text-align: center; width: 90%; max-width: 600px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); }
-            
-            button { 
-                padding: 1rem 1.5rem; border-radius: 30px; border: none; font-size: 1rem; cursor: pointer; margin: 10px; font-weight: bold; transition: all 0.2s;
-            }
-            button:active { transform: scale(0.95); }
-            
-            #btn-start { background: #00d2ff; color: #000; }
-            #btn-stop { background: #ff4b4b; color: #fff; display: none; }
-            #btn-register { background: #28a745; color: #fff; display: none; font-size: 0.9rem; padding: 0.8rem 1.2rem; }
-            
-            #status { 
-                margin-top: 1rem; font-size: 1.3rem; min-height: 1.5em; font-weight: bold;
-                padding: 10px; border-radius: 8px; background: rgba(0,0,0,0.2);
+            body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; display: grid; place-items: center; min-height: 90vh; background: #202c33; color: #e9edef; margin: 0; }
+            #container { background: #111b21; padding: 0; border-radius: 0; text-align: center; width: 100%; max-width: 600px; height: 100vh; display: flex; flex-direction: column; box-shadow: 0 0 20px rgba(0,0,0,0.5); }
+            @media (min-width: 600px) {
+                #container { height: 90vh; border-radius: 12px; }
             }
             
-            .bubble { text-align: left; padding: 12px 18px; margin: 8px; border-radius: 18px; display: inline-block; max-width: 80%; }
-            .row { display: flex; width: 100%; margin-bottom: 10px; }
+            header { background: #202c33; padding: 15px; border-bottom: 1px solid #374045; font-weight: bold; font-size: 1.1rem; display: flex; justify-content: space-between; align-items: center; }
+            
+            #chat-box { 
+                flex: 1; overflow-y: auto; padding: 20px; 
+                background-image: url("https://user-images.githubusercontent.com/15075759/28719144-86dc0f70-73b1-11e7-911d-60d70fcded21.png");
+                background-repeat: repeat;
+                background-size: 400px;
+                background-color: #0b141a;
+            }
+
+            .row { display: flex; width: 100%; margin-bottom: 8px; }
             .row.ai { justify-content: flex-start; }
             .row.user { justify-content: flex-end; }
             
-            .ai .bubble { background: #005c4b; color: #fff; border-bottom-left-radius: 4px; }
-            .user .bubble { background: #00d2ff; color: #000; border-bottom-right-radius: 4px; }
-            
-            #chat-box { 
-                height: 400px; overflow-y: auto; margin-top: 20px; border: 1px solid #555; padding: 10px; 
-                background: #2a2a2a; border-radius: 8px;
+            .bubble { 
+                padding: 8px 12px; border-radius: 8px; max-width: 75%; 
+                font-size: 0.95rem; line-height: 1.4; position: relative; word-wrap: break-word;
+                box-shadow: 0 1px 0.5px rgba(0,0,0,0.13);
             }
+            .ai .bubble { background: #202c33; color: #e9edef; border-top-left-radius: 0; }
+            .user .bubble { background: #005c4b; color: #e9edef; border-top-right-radius: 0; }
+            
+            #controls { background: #202c33; padding: 15px; border-top: 1px solid #374045; }
+            
+            button { 
+                padding: 10px 20px; border-radius: 24px; border: none; font-size: 1rem; cursor: pointer; margin: 0 5px; font-weight: bold; transition: opacity 0.2s;
+            }
+            button:active { opacity: 0.7; }
+            
+            #btn-start { background: #00a884; color: #fff; }
+            #btn-stop { background: #ef5350; color: #fff; display: none; }
+            #btn-register { background: #3b4a54; color: #fff; font-size: 0.8rem; padding: 8px 15px; }
+
+            #status { margin-bottom: 10px; font-size: 0.9rem; color: #8696a0; min-height: 1.2em; }
         </style>
     </head>
     <body>
         <div id="container">
-            <h1>Realtime Talk (L4)</h1>
-            <div>
-                <button id="btn-start">会話開始</button>
-                <button id="btn-stop">停止</button>
-            </div>
-            <div>
-                <button id="btn-register">➕ メンバーを追加</button>
-            </div>
+            <header>
+                <span>AI Agent</span>
+                <button id="btn-register">＋ メンバー追加</button>
+            </header>
             
-            <div id="status">待機中</div>
             <div id="chat-box"></div>
+            
+            <div id="controls">
+                <div id="status">接続待機中...</div>
+                <button id="btn-start">会話を始める</button>
+                <button id="btn-stop">終了する</button>
+            </div>
         </div>
 
         <script>
@@ -343,6 +348,7 @@ async def get_root():
 
             let audioQueue = [];
             let isPlaying = false;
+            let currentAiBubble = null; // 字幕用
 
             // --- UI Helper ---
             function logChat(role, text) {
@@ -354,34 +360,34 @@ async def get_root():
                 row.appendChild(bubble);
                 chatBox.appendChild(row);
                 chatBox.scrollTop = chatBox.scrollHeight;
+                return bubble; // 後から追記できるように要素を返す
             }
 
             // --- メンバー登録 ---
             btnRegister.onclick = async () => {
                 try {
                     await fetch('/enable-registration', { method: 'POST' });
-                    statusDiv.textContent = "🆕 新しい人が話してください (登録モード)";
-                    statusDiv.style.color = "#28a745";
-                    logChat('ai', "システム: 次に話す人の声を登録します。何か話しかけてください。");
+                    statusDiv.textContent = "🆕 新規メンバー登録モード";
+                    statusDiv.style.color = "#00a884";
+                    logChat('ai', "【システム】次に話す人の声を登録します。何か話しかけてください。");
                 } catch(e) { console.error(e); }
             };
 
             // --- WebSocket & Audio ---
             async function startRecording() {
                 try {
-                    statusDiv.textContent = "接続中...";
+                    statusDiv.textContent = "サーバー接続中...";
                     const wsProtocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
                     socket = new WebSocket(wsProtocol + window.location.host + '/ws');
                     socket.binaryType = 'arraybuffer';
 
                     socket.onopen = async () => {
                         console.log("WS Connected");
-                        statusDiv.textContent = "🎙️ お話しください";
-                        statusDiv.style.color = "#fff";
+                        statusDiv.textContent = "🎙️ 準備OK。話しかけてください";
+                        statusDiv.style.color = "#e9edef";
                         
                         btnStart.style.display = 'none';
                         btnStop.style.display = 'inline-block';
-                        btnRegister.style.display = 'inline-block';
                         
                         await initAudioStream();
                     };
@@ -393,23 +399,40 @@ async def get_root():
                         } else {
                             const data = JSON.parse(event.data);
                             
+                            // ステータス更新
                             if (data.status === 'processing') {
                                 statusDiv.textContent = data.message;
-                                if (data.message.includes("聞いて")) statusDiv.style.color = "#ff4b4b"; // 赤
-                                else if (data.message.includes("思考中")) statusDiv.style.color = "#00d2ff"; // 青
+                                if (data.message.includes("聞いて")) statusDiv.style.color = "#ef5350"; 
+                                else if (data.message.includes("思考中")) statusDiv.style.color = "#00a884";
                             }
                             
-                            if (data.status === 'transcribed') logChat('user', data.question_text);
-                            if (data.status === 'complete') {
-                                statusDiv.textContent = "🎙️ お話しください";
-                                statusDiv.style.color = "#fff";
+                            // ユーザーの発言（即字幕表示）
+                            if (data.status === 'transcribed') {
+                                logChat('user', data.question_text);
                             }
+
+                            // ★ 字幕処理 (AIの回答をストリーミング表示)
+                            if (data.status === 'reply_chunk') {
+                                if (!currentAiBubble) {
+                                    currentAiBubble = logChat('ai', ''); // 空のバブルを作成
+                                }
+                                currentAiBubble.textContent += data.text_chunk;
+                                chatBox.scrollTop = chatBox.scrollHeight;
+                            }
+
+                            // 完了時
+                            if (data.status === 'complete') {
+                                // もしchunkが一度も来なかった場合（短い返答など）の保険
+                                if (!currentAiBubble && data.answer_text) {
+                                    logChat('ai', data.answer_text);
+                                }
+                                currentAiBubble = null; // リセット
+                                statusDiv.textContent = "🎙️ 準備OK。話しかけてください";
+                                statusDiv.style.color = "#e9edef";
+                            }
+
                             if (data.status === 'ignored') {
                                 statusDiv.textContent = data.message;
-                                setTimeout(() => {
-                                     statusDiv.textContent = "🎙️ お話しください";
-                                     statusDiv.style.color = "#fff";
-                                }, 2000);
                             }
                         }
                     };
@@ -418,7 +441,7 @@ async def get_root():
 
                 } catch (e) {
                     console.error(e);
-                    statusDiv.textContent = "エラー発生";
+                    statusDiv.textContent = "接続エラー";
                 }
             }
 
@@ -457,9 +480,7 @@ async def get_root():
                 
                 btnStart.style.display = 'inline-block';
                 btnStop.style.display = 'none';
-                btnRegister.style.display = 'none';
                 statusDiv.textContent = "停止中";
-                statusDiv.style.color = "#fff";
             }
 
             // --- 再生ロジック ---

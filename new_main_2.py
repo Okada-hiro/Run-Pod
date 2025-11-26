@@ -1,4 +1,4 @@
-# /workspace/new_new_main.py (完全修正版: Web Audio API対応)
+# speakerguardで話者認証を行い、本人の声でなければ処理をスキップするFastAPIアプリケーション
 import uvicorn
 from fastapi import FastAPI, WebSocket, Request
 from fastapi.responses import HTMLResponse, FileResponse

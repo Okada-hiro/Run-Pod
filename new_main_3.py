@@ -1,7 +1,7 @@
-# /workspace/new_new_main.py (完全修正版: 爆速VAD & WAV直接送信 & メンバー追加機能)
+# 他の人を登録可能にしたFastAPIアプリケーション
 import uvicorn
 from fastapi import FastAPI, WebSocket, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.websockets import WebSocketDisconnect
 import os
@@ -9,7 +9,6 @@ import asyncio
 import time
 import logging 
 import sys 
-# pydubは入力変換のみに使用し、出力には使わないことで高速化
 from pydub import AudioSegment
 import io
 import re
@@ -39,14 +38,14 @@ except ImportError as e:
 # JIT profiling を無効化しない（=有効のまま）にする
 os.environ["SPEECHBRAIN_DISABLE_JIT_PROFILING"] = "0"
 
-from speaker_filter import SpeakerGuard
+from new_speaker_filter import SpeakerGuard
 speaker_guard = SpeakerGuard()
 
 # --- 設定 ---
 PROCESSING_DIR = "incoming_audio" 
 LANGUAGE = "ja"
 
-# 登録モード管理フラグ
+# ★追加: 次の音声を登録モードとして扱うかのフラグ
 NEXT_AUDIO_IS_REGISTRATION = False
 
 # --- アプリケーション初期化 ---
@@ -65,10 +64,10 @@ async def enable_registration():
 
 
 # ---------------------------
-# 1. 文ごとの処理関数 (修正版: WAV直接送信)
+# 1. 文ごとの処理関数
 # ---------------------------
 async def process_sentence(text: str, base_filename: str, index: int, websocket: WebSocket):
-    # logger.info(f"[STREAM] 文{index}: {text[:20]}...")
+    logger.info(f"[STREAM] 文{index}: {text[:20]}...")
     
     # (A) 字幕送信
     try:
@@ -91,19 +90,23 @@ async def process_sentence(text: str, base_filename: str, index: int, websocket:
     
     if success:
         try:
-            # (C) ★高速化修正: MP3変換を廃止。WAVバイナリを直接読み込んで送る
-            # AudioSegment を経由すると遅いので、生データを読む
-            with open(part_path_abs, 'rb') as f:
-                wav_data = f.read()
+            # (C) 音声チェックと変換
+            audio_segment = AudioSegment.from_wav(part_path_abs)
+            duration_sec = len(audio_segment) / 1000.0
+            
+            if duration_sec < 0.1:
+                logger.warning(f"⚠️ [AUDIO WARNING] 生成音声が短すぎます: {duration_sec}秒")
+            else:
+                logger.info(f"🔊 [AUDIO OK] 文{index} 長さ: {duration_sec}秒")
+
+            mp3_buffer = io.BytesIO()
+            audio_segment.export(mp3_buffer, format="mp3", bitrate="128k")
+            audio_data = mp3_buffer.getvalue()
 
             # (D) 送信
-            await websocket.send_bytes(wav_data)
-            
-            # ログ: 長さを確認したい場合のみ有効化
-            # logger.info(f"🔊 [AUDIO SENT] 文{index} サイズ: {len(wav_data)} bytes")
-
+            await websocket.send_bytes(audio_data)
         except Exception as e:
-            logger.error(f"[STREAM ERROR] 音声送信中にエラー: {e}", exc_info=True)
+            logger.error(f"[STREAM ERROR] 音声変換・送信中にエラー: {e}", exc_info=True)
 
 
 # ---------------------------
@@ -113,20 +116,28 @@ async def process_audio_file(audio_path: str, original_filename: str, websocket:
     global NEXT_AUDIO_IS_REGISTRATION
     logger.info(f"[TASK START] ファイル処理開始: {original_filename}")
     
-    # --- 話者判定・登録ロジック ---
+    # --- ★★★ 話者判定・登録ロジック (修正版) ★★★ ---
+    
+    # パターンA: 登録モードの場合
     if NEXT_AUDIO_IS_REGISTRATION:
         logger.info("[REGISTRATION] 新規話者登録を実行中...")
+        
+        # speaker_filter.py に register_new_speaker メソッドが実装されている前提
         success = await asyncio.to_thread(speaker_guard.register_new_speaker, audio_path)
+        
+        # フラグを戻す
         NEXT_AUDIO_IS_REGISTRATION = False
         
         if success:
             await websocket.send_json({"status": "ignored", "message": "✅ 新しいメンバーを登録しました！"})
         else:
             await websocket.send_json({"status": "error", "message": "登録に失敗しました"})
-        return
+        return  # 登録だけして会話はせず終了
 
-    # 通常会話モード (本人確認)
+    # パターンB: 通常会話モード (本人確認)
+    # speaker_filter.py の is_owner がリスト対応している前提
     is_owner = await asyncio.to_thread(speaker_guard.is_owner, audio_path)
+    
     if not is_owner:
         logger.info("[TASK] 未登録の話者のため無視しました")
         await websocket.send_json({"status": "ignored", "message": "🚫 未登録の声です"})
@@ -220,7 +231,6 @@ async def websocket_endpoint(websocket: WebSocket):
             
             def convert_audio():
                 try:
-                    # 入力はMP3等の可能性もあるためpydubでWAVに正規化
                     audio = AudioSegment.from_file(audio_io) 
                     audio = audio.set_frame_rate(16000).set_channels(1)
                     audio.export(output_wav_path, format="wav")
@@ -255,7 +265,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
 
 # ---------------------------
-# 4. フロントエンド (修正版 HTML/JS: 爆速VAD設定)
+# 4. フロントエンド (修正版 HTML/JS)
 # ---------------------------
 @app.get("/", response_class=HTMLResponse)
 async def get_root():
@@ -265,7 +275,7 @@ async def get_root():
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device.width, initial-scale=1.0">
-        <title>AI Voice Talk (Ultra Fast)</title>
+        <title>AI Voice Talk (Multi-User & Fast VAD)</title>
         
         <style>
             body { font-family: sans-serif; display: grid; place-items: center; min-height: 90vh; background: #f0f2f5; }
@@ -282,6 +292,7 @@ async def get_root():
             
             #startButton { background: #007bff; }
             #stopButton { background: #6c757d; }
+            /* 追加ボタン用スタイル */
             #addSpeakerButton { background: #28a745; font-size: 0.9rem; padding: 0.6rem 1.2rem; }
 
             #status { margin-top: 1.5rem; font-size: 1.1rem; color: #333; min-height: 1.5em; font-weight: bold; }
@@ -330,7 +341,7 @@ async def get_root():
             // --- グローバル変数 ---
             const startButton = document.getElementById('startButton');
             const stopButton = document.getElementById('stopButton');
-            const addSpeakerBtn = document.getElementById('addSpeakerButton');
+            const addSpeakerBtn = document.getElementById('addSpeakerButton'); // 追加
             const statusDiv = document.getElementById('status');
             const vadStatusDiv = document.getElementById('vad-status');
             const qaDisplay = document.getElementById('qa-display');
@@ -341,7 +352,7 @@ async def get_root():
             
             // Web Audio API用の変数
             let audioCtx = null;
-            let currentSource = null; 
+            let currentSource = null; // 現在再生中のソース
             
             let isSpeaking = false;     
             let audioQueue = [];        
@@ -363,7 +374,7 @@ async def get_root():
                 ws.onmessage = (event) => {
                     if (event.data instanceof ArrayBuffer) {
                         if (ignoreIncomingAudio) return;
-                        const audioBlob = new Blob([event.data], { type: 'audio/wav' }); // WAVとして受け取る
+                        const audioBlob = new Blob([event.data], { type: 'audio/mp3' });
                         audioQueue.push(audioBlob);
                         processAudioQueue();
                     } else {
@@ -414,18 +425,24 @@ async def get_root():
                     }
                 } else if (data.status === 'ignored') {
                     statusDiv.textContent = data.message;
-                    // 3秒後に表示を元に戻す（親切設計）
+                    
+                    // ★改善: 3秒後に表示を「待機中」に戻すタイマーをセット
                     setTimeout(() => {
                         if (statusDiv.textContent === data.message) {
                              statusDiv.textContent = '🟢 準備完了 (次の会話どうぞ)';
                         }
-                    }, 3000);
+                    }, 1000);
+                    // 必要ならバブルにも表示
+                    if (currentAnswerId) {
+                         const div = document.getElementById(currentAnswerId);
+                         if(div) div.textContent += " " + data.message;
+                    }
                 } else if (data.status === 'error') {
                     statusDiv.textContent = `エラー: ${data.message}`;
                 }
             }
             
-            // メンバー追加ボタン
+            // ★追加: メンバー追加ボタン処理
             addSpeakerBtn.onclick = async () => {
                 try {
                     await fetch('/enable-registration', { method: 'POST' });
@@ -438,7 +455,7 @@ async def get_root():
                 }
             };
 
-            // --- 3. Web Audio API ---
+            // --- 3. Web Audio API 初期化 ---
             async function initAudioContext() {
                 if (!audioCtx) {
                     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -446,7 +463,6 @@ async def get_root():
                 if (audioCtx.state === 'suspended') {
                     await audioCtx.resume();
                 }
-                // ダミー音再生でロック解除
                 const buffer = audioCtx.createBuffer(1, 1, 22050);
                 const source = audioCtx.createBufferSource();
                 source.buffer = buffer;
@@ -508,7 +524,7 @@ async def get_root():
                 }
             }
 
-            // --- 6. VAD & マイク設定 (★爆速設定★) ---
+            // --- 6. VAD & マイク設定 (高速化版) ---
             async function setupVAD() {
                 try {
                     startButton.disabled = true;
@@ -526,19 +542,12 @@ async def get_root():
                     
                     vad = await window.vad.MicVAD.new({
                         stream: mediaStream,
-                        
-                        // ★感度高め
+                        // ★修正: 感度を上げて反応を良くする
                         positiveSpeechThreshold: 0.8, 
                         minSpeechFrames: 4,
-                        
-                        // ★重要修正: 余韻を極限まで削る (3フレーム≒約0.1秒)
-                        // これで話し終わった瞬間に送信されます
-                        redemptionFrames: 3, 
-                        
-                        // ★重要修正: 開始バッファも削る (5フレーム≒約0.15秒)
-                        // これで送信データ量とサーバー負荷を減らします
-                        preSpeechPadFrames: 5,
-
+                        // ★修正: 余韻を短くして即送信 (約0.25秒)
+                        redemptionFrames: 8, 
+                        preSpeechPadFrames: 20,
                         onnxWASMBasePath: "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/",
                         baseAssetPath: "https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.29/dist/",
                         

@@ -1,122 +1,95 @@
-# /workspace/new_new_main.py (完全修正版: 爆速VAD & WAV直接送信 & メンバー追加機能)
+# /workspace/new_new_main.py
+# Final Speed Tuning: Aggressive VAD + In-Memory TTS
+
 import uvicorn
-from fastapi import FastAPI, WebSocket, Request
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.websockets import WebSocketDisconnect
-import os
+import torch
+import numpy as np
 import asyncio
-import time
-import logging 
-import sys 
-# pydubは入力変換のみに使用し、出力には使わないことで高速化
-from pydub import AudioSegment
+import logging
+import sys
+import os
 import io
 import re
+import scipy.io.wavfile as wavfile # メモリ書き出し用
 
 # --- ロギング設定 ---
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
-    handlers=[logging.StreamHandler(sys.stdout)] 
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger(__name__)
 
-# --- 処理モジュールのインポート ---
+# --- 必要なモジュールのインポート ---
 try:
-    from transcribe_func import whisper_text_only
-    # supporter_generator を優先してインポート
-    try:
-        from supporter_generator import generate_answer_stream
-    except ImportError:
-        from new_answer_generator import generate_answer_stream
-
-    from new_text_to_speech import synthesize_speech
+    from transcribe_func import GLOBAL_ASR_MODEL_INSTANCE
+    from supporter_generator import generate_answer_stream
+    # TTSのsynthesize_speechは使わず、モデルを直接叩くためインポート不要だが
+    # グローバルモデルへのアクセスのために new_text_to_speech を参照
+    import new_text_to_speech as tts_module
+    from new_speaker_filter import SpeakerGuard
 except ImportError as e:
-    print(f"[ERROR] 必要なモジュールが見つかりません: {e}")
+    logger.error(f"[ERROR] 必要なモジュールが見つかりません: {e}")
+    sys.exit(1)
 
-
-# JIT profiling を無効化しない（=有効のまま）にする
-os.environ["SPEECHBRAIN_DISABLE_JIT_PROFILING"] = "0"
-
-from new_speaker_filter import SpeakerGuard
-speaker_guard = SpeakerGuard()
-
-# --- 設定 ---
-PROCESSING_DIR = "incoming_audio" 
-LANGUAGE = "ja"
-
-# 登録モード管理フラグ
-NEXT_AUDIO_IS_REGISTRATION = False
-
-# --- アプリケーション初期化 ---
-app = FastAPI()
+# --- グローバル設定 ---
+PROCESSING_DIR = "incoming_audio"
 os.makedirs(PROCESSING_DIR, exist_ok=True)
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+logger.info(f"Using Device: {DEVICE}")
+
+app = FastAPI()
 app.mount(f"/download", StaticFiles(directory=PROCESSING_DIR), name="download")
 
+# SpeakerGuard初期化
+speaker_guard = SpeakerGuard()
+NEXT_AUDIO_IS_REGISTRATION = False
 
-# ★追加: 登録モード有効化のエンドポイント
+# --- Silero VAD のロード ---
+logger.info("⏳ Loading Silero VAD model...")
+try:
+    vad_model, utils = torch.hub.load(
+        repo_or_dir='snakers4/silero-vad',
+        model='silero_vad',
+        force_reload=False,
+        onnx=False
+    )
+    (get_speech_timestamps, save_audio, read_audio, VADIterator, collect_chunks) = utils
+    vad_model.to(DEVICE)
+    logger.info("✅ Silero VAD model loaded.")
+except Exception as e:
+    logger.critical(f"Silero VAD Load Failed: {e}")
+    sys.exit(1)
+
+
+# --- API: 登録モード切替 ---
 @app.post("/enable-registration")
 async def enable_registration():
     global NEXT_AUDIO_IS_REGISTRATION
     NEXT_AUDIO_IS_REGISTRATION = True
-    logger.info("【モード切替】次の音声を新規話者として登録します")
+    logger.info("【モード切替】次の発話を新規話者として登録します")
     return {"message": "登録モード待機中"}
 
 
-# ---------------------------
-# 1. 文ごとの処理関数 (修正版: WAV直接送信)
-# ---------------------------
-async def process_sentence(text: str, base_filename: str, index: int, websocket: WebSocket):
-    # logger.info(f"[STREAM] 文{index}: {text[:20]}...")
-    
-    # (A) 字幕送信
-    try:
-        await websocket.send_json({
-            "status": "reply_chunk",
-            "text_chunk": text
-        })
-    except Exception as e:
-        logger.error(f"[STREAM ERROR] テキスト送信失敗: {e}")
-
-    # (B) 音声合成
-    part_filename = f"{base_filename}.part{index}.wav"
-    part_path_abs = os.path.abspath(os.path.join(PROCESSING_DIR, part_filename))
-
-    success = await asyncio.to_thread(
-        synthesize_speech,
-        text_to_speak=text,
-        output_wav_path=part_path_abs
-    )
-    
-    if success:
-        try:
-            # (C) ★高速化修正: MP3変換を廃止。WAVバイナリを直接読み込んで送る
-            # AudioSegment を経由すると遅いので、生データを読む
-            with open(part_path_abs, 'rb') as f:
-                wav_data = f.read()
-
-            # (D) 送信
-            await websocket.send_bytes(wav_data)
-            
-            # ログ: 長さを確認したい場合のみ有効化
-            # logger.info(f"🔊 [AUDIO SENT] 文{index} サイズ: {len(wav_data)} bytes")
-
-        except Exception as e:
-            logger.error(f"[STREAM ERROR] 音声送信中にエラー: {e}", exc_info=True)
-
-
-# ---------------------------
-# 2. バックグラウンド処理 (メインフロー)
-# ---------------------------
-async def process_audio_file(audio_path: str, original_filename: str, websocket: WebSocket, chat_history: list):
+# --- ヘルパー: 音声処理パイプライン ---
+async def process_voice_pipeline(audio_float32_np, websocket: WebSocket, chat_history: list):
     global NEXT_AUDIO_IS_REGISTRATION
-    logger.info(f"[TASK START] ファイル処理開始: {original_filename}")
     
-    # --- 話者判定・登録ロジック ---
+    # SpeakerGuard用に Tensor化 (1, samples)
+    voice_tensor = torch.from_numpy(audio_float32_np).float().unsqueeze(0)
+
+    # ---------------------------
+    # 0. 話者登録モード
+    # ---------------------------
     if NEXT_AUDIO_IS_REGISTRATION:
-        logger.info("[REGISTRATION] 新規話者登録を実行中...")
-        success = await asyncio.to_thread(speaker_guard.register_new_speaker, audio_path)
+        temp_reg_path = f"{PROCESSING_DIR}/reg_{id(audio_float32_np)}.wav"
+        import soundfile as sf
+        sf.write(temp_reg_path, audio_float32_np, 16000)
+        
+        success = await asyncio.to_thread(speaker_guard.register_new_speaker, temp_reg_path)
         NEXT_AUDIO_IS_REGISTRATION = False
         
         if success:
@@ -125,137 +98,218 @@ async def process_audio_file(audio_path: str, original_filename: str, websocket:
             await websocket.send_json({"status": "error", "message": "登録に失敗しました"})
         return
 
-    # 通常会話モード (本人確認)
-    is_owner = await asyncio.to_thread(speaker_guard.is_owner, audio_path)
-    if not is_owner:
-        logger.info("[TASK] 未登録の話者のため無視しました")
-        await websocket.send_json({"status": "ignored", "message": "🚫 未登録の声です"})
-        return 
-    # --------------------------------------------------
+    # ---------------------------
+    # 1. 話者認識 (SpeakerGuard)
+    # ---------------------------
+    is_allowed = await asyncio.to_thread(speaker_guard.verify_tensor, voice_tensor)
 
+    if not is_allowed:
+        logger.info("[Access Denied] 登録されていない話者です。")
+        await websocket.send_json({"status": "ignored", "message": "🚫 未登録の声です (ブロック)"})
+        return
+
+    # ---------------------------
+    # 2. Whisper 文字起こし
+    # ---------------------------
     try:
-        # --- 文字起こし ---
-        output_txt_path = os.path.join(PROCESSING_DIR, original_filename + ".txt")
-        
-        question_text = await asyncio.to_thread(
-            whisper_text_only,
-            audio_path, language=LANGUAGE, output_txt=output_txt_path
-        )
-        logger.info(f"[TASK] 文字起こし完了: {question_text}")
+        if GLOBAL_ASR_MODEL_INSTANCE is None:
+            raise ValueError("Whisper Model not loaded")
 
+        # faster-whisper は numpy array を直接受け取れる
+        segments = await asyncio.to_thread(
+            GLOBAL_ASR_MODEL_INSTANCE.transcribe, 
+            audio_float32_np
+        )
+        
+        text = "".join([s[2] for s in GLOBAL_ASR_MODEL_INSTANCE.ts_words(segments)])
+        
+        if not text.strip():
+            # logger.info("[TASK] 空の認識結果")
+            return
+
+        logger.info(f"📝 認識: {text}")
         await websocket.send_json({
             "status": "transcribed",
-            "message": "...",
-            "question_text": question_text
+            "question_text": text
         })
 
-        # --- ストリーミング回答 & パイプライン処理 ---
-        text_buffer = ""
-        sentence_count = 0
-        full_answer_log = ""
-        split_pattern = r'(?<=[。！？\n、])'
+        # ---------------------------
+        # 3. LLM & TTS ストリーミング
+        # ---------------------------
+        await handle_llm_tts(text, websocket, chat_history)
 
-        iterator = generate_answer_stream(question_text, history=chat_history)
+    except Exception as e:
+        logger.error(f"Pipeline Error: {e}", exc_info=True)
+        await websocket.send_json({"status": "error", "message": "処理エラー"})
 
-        for chunk_text in iterator:
-            text_buffer += chunk_text
-            full_answer_log += chunk_text 
 
-            # [SILENCE] チェック
-            if full_answer_log.strip() == "[SILENCE]":
-                logger.info("[TASK] SILENCE検出。応答をスキップします。")
-                await websocket.send_json({"status": "ignored", "message": "（音声を無視しました）"})
+# --- ヘルパー: 回答生成と音声合成 (In-Memory高速化版) ---
+async def handle_llm_tts(text: str, websocket: WebSocket, chat_history: list):
+    text_buffer = ""
+    sentence_count = 0
+    full_answer = ""
+    # 句読点で細かく区切る
+    split_pattern = r'(?<=[。！？\n、])'
+
+    iterator = generate_answer_stream(text, history=chat_history)
+
+    # ★高速化: ファイル保存をスキップしてメモリ上でWAV生成
+    async def send_audio_chunk_memory(phrase):
+        if not phrase: return
+        try:
+            # TTSモデルを直接呼び出し
+            # new_text_to_speech.py のグローバルモデルを使用
+            model = tts_module.GLOBAL_TTS_MODEL
+            spk_id = tts_module.GLOBAL_SPEAKER_ID
+            
+            if model is None: return
+
+            # 推論 (GPU)
+            sr, audio_data = await asyncio.to_thread(
+                model.infer,
+                text=phrase,
+                speaker_id=spk_id,
+                style="Neutral",
+                style_weight=0.5, # 少し弱めて速度優先
+                sdp_ratio=0.2,
+                noise=0.6,
+                noise_w=0.8,
+                length=1.0
+            )
+            
+            # Int16変換
+            if audio_data.dtype != np.int16:
+                audio_norm = audio_data / np.abs(audio_data).max()
+                audio_int16 = (audio_norm * 32767).astype(np.int16)
+            else:
+                audio_int16 = audio_data
+
+            # メモリ上でWAV化 (BytesIO)
+            mem_file = io.BytesIO()
+            wavfile.write(mem_file, sr, audio_int16)
+            wav_bytes = mem_file.getvalue()
+            
+            # 送信
+            await websocket.send_bytes(wav_bytes)
+
+        except Exception as e:
+            logger.error(f"TTS Gen Error: {e}")
+
+    try:
+        for chunk in iterator:
+            text_buffer += chunk
+            full_answer += chunk
+            
+            if full_answer.strip() == "[SILENCE]":
+                await websocket.send_json({"status": "ignored", "message": "（応答なし）"})
                 return
 
-            # バッファ分割
             sentences = re.split(split_pattern, text_buffer)
             if len(sentences) > 1:
                 for sent in sentences[:-1]:
                     if sent.strip():
                         sentence_count += 1
-                        await process_sentence(sent, original_filename, sentence_count, websocket)
+                        await websocket.send_json({"status": "reply_chunk", "text_chunk": sent})
+                        # メモリ経由で送信
+                        await send_audio_chunk_memory(sent)
                 text_buffer = sentences[-1]
-
-        # 残り処理
+        
         if text_buffer.strip():
-            if text_buffer.strip() == "[SILENCE]":
-                 await websocket.send_json({"status": "ignored", "message": "（音声を無視しました）"})
-                 return
-
             sentence_count += 1
-            await process_sentence(text_buffer, original_filename, sentence_count, websocket)
+            await websocket.send_json({"status": "reply_chunk", "text_chunk": text_buffer})
+            await send_audio_chunk_memory(text_buffer)
+
+        chat_history.append({"role": "user", "parts": [text]})
+        chat_history.append({"role": "model", "parts": [full_answer]})
         
-        # 履歴更新
-        chat_history.append({"role": "user", "parts": [question_text]})
-        chat_history.append({"role": "model", "parts": [full_answer_log]})
-        
-        await websocket.send_json({"status": "complete", "answer_text": full_answer_log})
-        logger.info(f"[TASK END] 完了. 現在の履歴数: {len(chat_history)//2}ターン")
+        await websocket.send_json({"status": "complete", "answer_text": full_answer})
 
     except Exception as e:
-        logger.error(f"[TASK ERROR] エラー: {e}", exc_info=True)
-        try:
-            await websocket.send_json({"status": "error", "message": f"エラー: {e}"})
-        except WebSocketDisconnect:
-            pass 
+        logger.error(f"LLM/TTS Error: {e}")
+
 
 # ---------------------------
-# 3. WebSocket エンドポイント
+# WebSocket エンドポイント (鬼VAD設定)
 # ---------------------------
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    logger.info("[WS] クライアント接続")
+    logger.info("[WS] Client Connected.")
     
+    # ★★★ 最重要チューニング箇所 ★★★
+    # threshold: 0.8 (自信度80%未満はノイズとみなす。これで息遣いを除去)
+    # min_silence_duration_ms: 200 (200ms無音なら即終了。デフォルト100だと早すぎる場合があるので微調整)
+    # speech_pad_ms: 10 (余計な余韻をつけない)
+    vad_iterator = VADIterator(
+        vad_model, 
+        threshold=0.8, 
+        min_silence_duration_ms=200, 
+        speech_pad_ms=10
+    )
+    
+    audio_buffer = [] 
+    is_speaking = False
+    
+    WINDOW_SIZE_SAMPLES = 512 
+    SAMPLE_RATE = 16000
     chat_history = []
-    
+
     try:
         while True:
-            audio_data = await websocket.receive_bytes()
-            audio_io = io.BytesIO(audio_data)
+            # 1. 受信
+            data_bytes = await websocket.receive_bytes()
+            audio_chunk_np = np.frombuffer(data_bytes, dtype=np.float32).copy()
             
-            temp_id = f"ws_{int(time.time())}"
-            output_wav_filename = f"{temp_id}.wav"
-            output_wav_path = os.path.join(PROCESSING_DIR, output_wav_filename)
-            
-            def convert_audio():
-                try:
-                    # 入力はMP3等の可能性もあるためpydubでWAVに正規化
-                    audio = AudioSegment.from_file(audio_io) 
-                    audio = audio.set_frame_rate(16000).set_channels(1)
-                    audio.export(output_wav_path, format="wav")
-                    return True
-                except Exception as e:
-                    logger.error(f"[WS ERROR] 変換失敗: {e}")
-                    return False
+            # 2. 512サンプル分割ループ
+            offset = 0
+            while offset + WINDOW_SIZE_SAMPLES <= len(audio_chunk_np):
+                window_np = audio_chunk_np[offset : offset + WINDOW_SIZE_SAMPLES]
+                offset += WINDOW_SIZE_SAMPLES
+                
+                # Tensor化
+                window_tensor = torch.from_numpy(window_np).unsqueeze(0).to(DEVICE)
 
-            if not await asyncio.to_thread(convert_audio):
-                await websocket.send_json({"status": "error", "message": "音声形式エラー"})
-                continue
-            
-            # 処理開始通知
-            await websocket.send_json({"status": "processing", "message": "認識中..."})
+                # VAD判定
+                speech_dict = await asyncio.to_thread(vad_iterator, window_tensor, return_seconds=True)
+                
+                if speech_dict:
+                    if "start" in speech_dict:
+                        logger.info("🗣️ Start")
+                        is_speaking = True
+                        await websocket.send_json({"status": "processing", "message": "👂 聞いています..."})
+                        audio_buffer = [window_np] 
+                    
+                    elif "end" in speech_dict:
+                        logger.info("🤫 End (Cut!)") # 即カットログ
+                        if is_speaking:
+                            is_speaking = False
+                            audio_buffer.append(window_np)
+                            
+                            full_audio = np.concatenate(audio_buffer)
+                            
+                            # ノイズ判定 (0.2秒以下は無視)
+                            if len(full_audio) / SAMPLE_RATE < 0.2:
+                                await websocket.send_json({"status": "ignored", "message": "..."})
+                            else:
+                                await websocket.send_json({"status": "processing", "message": "🧠 AI思考中..."})
+                                await process_voice_pipeline(full_audio, websocket, chat_history)
+                            
+                            audio_buffer = [] 
+                
+                else:
+                    if is_speaking:
+                        audio_buffer.append(window_np)
 
-            asyncio.create_task(process_audio_file(
-                output_wav_path, 
-                output_wav_filename, 
-                websocket,
-                chat_history
-            ))
-            
     except WebSocketDisconnect:
-        logger.info("[WS] 切断")
+        logger.info("[WS] Disconnected")
     except Exception as e:
-        logger.error(f"[WS ERROR] : {e}", exc_info=True)
+        logger.error(f"[WS ERROR] {e}", exc_info=True)
     finally:
-        try:
-            await websocket.close()
-        except:
-            pass
+        vad_iterator.reset_states()
 
 
 # ---------------------------
-# 4. フロントエンド (修正版 HTML/JS: 爆速VAD設定)
+# フロントエンド
 # ---------------------------
 @app.get("/", response_class=HTMLResponse)
 async def get_root():
@@ -265,371 +319,162 @@ async def get_root():
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device.width, initial-scale=1.0">
-        <title>AI Voice Talk (Ultra Fast)</title>
-        
+        <title>Ultra Fast AI Talk</title>
         <style>
-            body { font-family: sans-serif; display: grid; place-items: center; min-height: 90vh; background: #f0f2f5; }
-            #container { background: white; padding: 2rem; border-radius: 12px; box-shadow: 0 8px 20px rgba(0,0,0,0.1); text-align: center; width: 90%; max-width: 600px; }
+            body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; display: grid; place-items: center; min-height: 90vh; background: #202c33; color: #e9edef; margin: 0; }
+            #container { background: #111b21; padding: 0; border-radius: 0; text-align: center; width: 100%; max-width: 600px; height: 100vh; display: flex; flex-direction: column; }
+            @media (min-width: 600px) { #container { height: 90vh; border-radius: 12px; } }
             
-            button {
-                font-size: 1rem; padding: 0.8rem 1.5rem; border: none; 
-                border-radius: 25px; cursor: pointer; margin: 0.5rem; 
-                color: white; transition: transform 0.1s, opacity 0.2s;
-                font-weight: bold;
-            }
-            button:active { transform: scale(0.98); }
-            button:disabled { background: #ccc !important; cursor: not-allowed; opacity: 0.6; transform: none; }
-            
-            #startButton { background: #007bff; }
-            #stopButton { background: #6c757d; }
-            #addSpeakerButton { background: #28a745; font-size: 0.9rem; padding: 0.6rem 1.2rem; }
-
-            #status { margin-top: 1.5rem; font-size: 1.1rem; color: #333; min-height: 1.5em; font-weight: bold; }
-            #vad-status { font-size: 0.9rem; color: #666; height: 1.5em; margin-bottom: 10px;}
-            
-            #qa-display { 
-                margin: 1rem auto 0 auto; text-align: left; width: 100%; 
-                border-top: 2px solid #f0f0f0; padding-top: 1rem; 
-                max-height: 400px; overflow-y: auto;
-            }
-            .bubble {
-                padding: 10px 15px; border-radius: 15px; margin-bottom: 10px;
-                line-height: 1.5; position: relative;
-            }
-            .user-bubble { background: #e7f5ff; color: #0056b3; margin-left: 20px; border-bottom-right-radius: 2px;}
-            .user-bubble::before { content: 'あなた'; font-size: 0.7rem; position: absolute; top: -18px; right: 0; color: #999; }
-            
-            .ai-bubble { background: #f0fff4; color: #155724; margin-right: 20px; border-bottom-left-radius: 2px;}
-            .ai-bubble::before { content: 'AI'; font-size: 0.7rem; position: absolute; top: -18px; left: 0; color: #999; }
+            header { background: #202c33; padding: 15px; border-bottom: 1px solid #374045; font-weight: bold; font-size: 1.1rem; display: flex; justify-content: space-between; align-items: center; }
+            #chat-box { flex: 1; overflow-y: auto; padding: 20px; background-color: #0b141a; }
+            .row { display: flex; width: 100%; margin-bottom: 8px; }
+            .row.ai { justify-content: flex-start; }
+            .row.user { justify-content: flex-end; }
+            .bubble { padding: 8px 12px; border-radius: 8px; max-width: 75%; font-size: 0.95rem; line-height: 1.4; word-wrap: break-word; }
+            .ai .bubble { background: #202c33; color: #e9edef; border-top-left-radius: 0; }
+            .user .bubble { background: #005c4b; color: #e9edef; border-top-right-radius: 0; }
+            #controls { background: #202c33; padding: 15px; border-top: 1px solid #374045; }
+            button { padding: 10px 20px; border-radius: 24px; border: none; font-size: 1rem; cursor: pointer; margin: 0 5px; font-weight: bold; }
+            #btn-start { background: #00a884; color: #fff; }
+            #btn-stop { background: #ef5350; color: #fff; display: none; }
+            #btn-register { background: #3b4a54; color: #fff; font-size: 0.8rem; padding: 8px 15px; }
+            #status { margin-bottom: 10px; font-size: 0.9rem; color: #8696a0; min-height: 1.2em; }
         </style>
     </head>
     <body>
         <div id="container">
-            <h1>AI Voice Talk ⚡</h1>
-            <p>いつでも話しかけてください（割り込み可能）</p>
-            
-            <div>
-                <button id="startButton">マイクON</button>
-                <button id="stopButton" disabled>マイクOFF</button>
+            <header>
+                <span>AI Agent ⚡</span>
+                <button id="btn-register">＋ メンバー追加</button>
+            </header>
+            <div id="chat-box"></div>
+            <div id="controls">
+                <div id="status">接続待機中...</div>
+                <button id="btn-start">会話を始める</button>
+                <button id="btn-stop">終了する</button>
             </div>
-            
-            <div style="margin-top: 10px;">
-                <button id="addSpeakerButton">＋ メンバーを追加</button>
-            </div>
-            
-            <div id="status">準備完了</div>
-            <div id="vad-status">(待機中)</div>
-            
-            <div id="qa-display"></div>
         </div>
-
-        <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.wasm.min.js"></script>
-        <script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.29/dist/bundle.min.js"></script>
-
         <script>
-            // --- グローバル変数 ---
-            const startButton = document.getElementById('startButton');
-            const stopButton = document.getElementById('stopButton');
-            const addSpeakerBtn = document.getElementById('addSpeakerButton');
+            let socket;
+            let audioContext;
+            let processor;
+            let source;
+            let isRecording = false;
+            const btnStart = document.getElementById('btn-start');
+            const btnStop = document.getElementById('btn-stop');
+            const btnRegister = document.getElementById('btn-register');
             const statusDiv = document.getElementById('status');
-            const vadStatusDiv = document.getElementById('vad-status');
-            const qaDisplay = document.getElementById('qa-display');
+            const chatBox = document.getElementById('chat-box');
+            let audioQueue = [];
+            let isPlaying = false;
+            let currentAiBubble = null;
 
-            let ws;
-            let vad; 
-            let mediaStream; 
-            
-            // Web Audio API用の変数
-            let audioCtx = null;
-            let currentSource = null; 
-            
-            let isSpeaking = false;     
-            let audioQueue = [];        
-            let isPlaying = false;      
-            let ignoreIncomingAudio = false; 
-
-            // --- 1. WebSocket接続 ---
-            function connectWebSocket() {
-                const wsProtocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
-                ws = new WebSocket(wsProtocol + window.location.host + '/ws');
-                ws.binaryType = 'arraybuffer';
-
-                ws.onopen = () => {
-                    console.log('WebSocket 接続');
-                    statusDiv.textContent = '接続完了。マイクをONにしてください。';
-                    startButton.disabled = false;
-                };
-
-                ws.onmessage = (event) => {
-                    if (event.data instanceof ArrayBuffer) {
-                        if (ignoreIncomingAudio) return;
-                        const audioBlob = new Blob([event.data], { type: 'audio/wav' }); // WAVとして受け取る
-                        audioQueue.push(audioBlob);
-                        processAudioQueue();
-                    } else {
-                        try {
-                            const data = JSON.parse(event.data);
-                            handleJsonMessage(data);
-                        } catch (e) { console.error(e); }
-                    }
-                };
-
-                ws.onclose = () => {
-                    statusDiv.textContent = '再接続してください。';
-                    stopVAD(); 
-                };
+            function logChat(role, text) {
+                const row = document.createElement('div');
+                row.className = `row ${role}`;
+                const bubble = document.createElement('div');
+                bubble.className = 'bubble';
+                bubble.textContent = text;
+                row.appendChild(bubble);
+                chatBox.appendChild(row);
+                chatBox.scrollTop = chatBox.scrollHeight;
+                return bubble;
             }
 
-            // --- 2. UI操作 ---
-            let currentQuestionId = null;
-            let currentAnswerId = null;
-
-            function appendBubble(role, text, id) {
-                let div = document.getElementById(id);
-                if (!div) {
-                    div = document.createElement('div');
-                    div.id = id;
-                    div.className = `bubble ${role === 'user' ? 'user-bubble' : 'ai-bubble'}`;
-                    qaDisplay.appendChild(div);
-                    qaDisplay.scrollTop = qaDisplay.scrollHeight;
-                }
-                div.textContent = text;
-            }
-
-            function handleJsonMessage(data) {
-                if (data.status === 'processing') {
-                    statusDiv.textContent = data.message;
-                } else if (data.status === 'transcribed') {
-                    currentQuestionId = `q-${Date.now()}`;
-                    appendBubble('user', data.question_text, currentQuestionId);
-                    currentAnswerId = `a-${Date.now()}`;
-                    appendBubble('ai', '...', currentAnswerId);
-                } else if (data.status === 'reply_chunk') {
-                    if (ignoreIncomingAudio) return;
-                    const div = document.getElementById(currentAnswerId);
-                    if (div) {
-                        if (div.textContent === '...') div.textContent = '';
-                        div.textContent += data.text_chunk;
-                        qaDisplay.scrollTop = qaDisplay.scrollHeight;
-                    }
-                } else if (data.status === 'ignored') {
-                    statusDiv.textContent = data.message;
-                    // 3秒後に表示を元に戻す（親切設計）
-                    setTimeout(() => {
-                        if (statusDiv.textContent === data.message) {
-                             statusDiv.textContent = '🟢 準備完了 (次の会話どうぞ)';
-                        }
-                    }, 3000);
-                } else if (data.status === 'error') {
-                    statusDiv.textContent = `エラー: ${data.message}`;
-                }
-            }
-            
-            // メンバー追加ボタン
-            addSpeakerBtn.onclick = async () => {
+            btnRegister.onclick = async () => {
                 try {
                     await fetch('/enable-registration', { method: 'POST' });
-                    statusDiv.textContent = '🆕 次に話す人を登録します。新しい人が何か話してください...';
-                    statusDiv.style.color = '#28a745';
-                    appendBubble('ai', '新しいメンバーの方、登録しますので何か話しかけてください。', `sys-${Date.now()}`);
-                } catch (e) {
-                    console.error(e);
-                    statusDiv.textContent = 'エラー: 登録モードに失敗';
-                }
+                    statusDiv.textContent = "🆕 新規メンバー登録モード";
+                    statusDiv.style.color = "#00a884";
+                } catch(e) {}
             };
 
-            // --- 3. Web Audio API ---
-            async function initAudioContext() {
-                if (!audioCtx) {
-                    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-                }
-                if (audioCtx.state === 'suspended') {
-                    await audioCtx.resume();
-                }
-                // ダミー音再生でロック解除
-                const buffer = audioCtx.createBuffer(1, 1, 22050);
-                const source = audioCtx.createBufferSource();
-                source.buffer = buffer;
-                source.connect(audioCtx.destination);
-                source.start(0);
-                console.log("🔊 AudioContext unlocked:", audioCtx.state);
-            }
-
-            // --- 4. 音声再生ロジック ---
-            function processAudioQueue() {
-                if (isPlaying) return;
-                if (audioQueue.length === 0) return;
-                const nextBlob = audioQueue.shift();
-                playAudioBlob(nextBlob);
-            }
-
-            async function playAudioBlob(blob) {
-                if (!audioCtx) return; 
-                isPlaying = true;
-                statusDiv.textContent = '🔊 AI回答中...';
-
+            async function startRecording() {
                 try {
-                    const arrayBuffer = await blob.arrayBuffer();
-                    const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
-                    const source = audioCtx.createBufferSource();
-                    source.buffer = audioBuffer;
-                    source.connect(audioCtx.destination);
-                    currentSource = source; 
-
-                    source.onended = () => {
-                        isPlaying = false;
-                        currentSource = null;
-                        processAudioQueue();
-                        if (audioQueue.length === 0) {
-                            statusDiv.textContent = '🟢 完了。次の質問をどうぞ。';
+                    statusDiv.textContent = "接続中...";
+                    const wsProtocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
+                    socket = new WebSocket(wsProtocol + window.location.host + '/ws');
+                    socket.binaryType = 'arraybuffer';
+                    socket.onopen = async () => {
+                        console.log("WS Connected");
+                        statusDiv.textContent = "🎙️ 準備OK";
+                        statusDiv.style.color = "#e9edef";
+                        btnStart.style.display = 'none';
+                        btnStop.style.display = 'inline-block';
+                        await initAudioStream();
+                    };
+                    socket.onmessage = async (event) => {
+                        if (event.data instanceof ArrayBuffer) {
+                            audioQueue.push(event.data);
+                            processAudioQueue();
+                        } else {
+                            const data = JSON.parse(event.data);
+                            if (data.status === 'processing') {
+                                statusDiv.textContent = data.message;
+                                if (data.message.includes("聞いて")) statusDiv.style.color = "#ef5350"; 
+                                else if (data.message.includes("思考中")) statusDiv.style.color = "#00a884";
+                            }
+                            if (data.status === 'transcribed') logChat('user', data.question_text);
+                            if (data.status === 'reply_chunk') {
+                                if (!currentAiBubble) currentAiBubble = logChat('ai', '');
+                                currentAiBubble.textContent += data.text_chunk;
+                                chatBox.scrollTop = chatBox.scrollHeight;
+                            }
+                            if (data.status === 'complete') {
+                                if (!currentAiBubble && data.answer_text) logChat('ai', data.answer_text);
+                                currentAiBubble = null;
+                                statusDiv.textContent = "🎙️ 準備OK";
+                                statusDiv.style.color = "#e9edef";
+                            }
+                            if (data.status === 'ignored') statusDiv.textContent = data.message;
                         }
                     };
-                    source.start(0);
-                } catch (e) {
-                    console.error("再生エラー:", e);
-                    isPlaying = false;
-                    processAudioQueue();
-                }
+                    socket.onclose = () => stopRecording();
+                } catch (e) { statusDiv.textContent = "接続エラー"; }
             }
 
-            // --- 5. 割り込み処理 ---
-            function interruptAudio() {
-                if (currentSource) {
-                    try { currentSource.stop(); } catch(e){}
-                    currentSource = null;
-                }
-                audioQueue = [];
-                isPlaying = false;
-                ignoreIncomingAudio = true;
-                statusDiv.textContent = '⛔ 中断。あなたの声を聞いています。';
-                if (currentAnswerId) {
-                    const div = document.getElementById(currentAnswerId);
-                    if (div) div.textContent += " (中断)";
-                }
+            async function initAudioStream() {
+                audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+                source = audioContext.createMediaStreamSource(stream);
+                processor = audioContext.createScriptProcessor(4096, 1, 1);
+                processor.onaudioprocess = (e) => {
+                    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+                    socket.send(e.inputBuffer.getChannelData(0).buffer);
+                };
+                source.connect(processor);
+                processor.connect(audioContext.destination);
+                isRecording = true;
             }
 
-            // --- 6. VAD & マイク設定 (★爆速設定★) ---
-            async function setupVAD() {
+            function stopRecording() {
+                isRecording = false;
+                if (source) source.disconnect();
+                if (processor) processor.disconnect();
+                if (audioContext) audioContext.close();
+                if (socket) socket.close();
+                btnStart.style.display = 'inline-block';
+                btnStop.style.display = 'none';
+                statusDiv.textContent = "停止中";
+            }
+
+            async function processAudioQueue() {
+                if (isPlaying || audioQueue.length === 0) return;
+                isPlaying = true;
+                const wavData = audioQueue.shift();
                 try {
-                    startButton.disabled = true;
-                    statusDiv.textContent = 'マイク準備中...';
-
-                    while (!window.vad) await new Promise(r => setTimeout(r, 50));
-                    
-                    mediaStream = await navigator.mediaDevices.getUserMedia({ 
-                        audio: {
-                            echoCancellation: false,
-                            noiseSuppression: false,
-                            autoGainControl: false
-                        } 
-                    });
-                    
-                    vad = await window.vad.MicVAD.new({
-                        stream: mediaStream,
-                        
-                        // ★感度高め
-                        positiveSpeechThreshold: 0.8, 
-                        minSpeechFrames: 2,
-                        
-                        // ★重要修正: 余韻を極限まで削る (3フレーム≒約0.1秒)
-                        // これで話し終わった瞬間に送信されます
-                        redemptionFrames: 0, 
-                        
-                        // ★重要修正: 開始バッファも削る (5フレーム≒約0.15秒)
-                        // これで送信データ量とサーバー負荷を減らします
-                        preSpeechPadFrames: 3,
-
-                        // ★★★ 追加修正: 話し終わりの基準を厳しくする ★★★
-                        // これを設定しないと、雑音がある限り録音が止まりません。
-                        // 0.6〜0.65 に設定することで、声が弱まった瞬間に「終わり」とみなします。
-                        negativeSpeechThreshold: 0.8,
-
-                        onnxWASMBasePath: "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/",
-                        baseAssetPath: "https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.29/dist/",
-                        
-                        onSpeechStart: () => {
-                            isSpeaking = true;
-                            vadStatusDiv.textContent = "🗣️ 感知中...";
-                            if (isPlaying || audioQueue.length > 0) {
-                                interruptAudio(); 
-                            }
-                        },
-                        
-                        onSpeechEnd: (audio) => {
-                            isSpeaking = false;
-                            vadStatusDiv.textContent = "📡 送信中...";
-                            if (ws && ws.readyState === WebSocket.OPEN) {
-                                ignoreIncomingAudio = false; 
-                                sendAudioAsWav(audio);
-                                statusDiv.textContent = 'AI思考中...';
-                            }
-                        }
-                    });
-
-                    vad.start();
-                    stopButton.disabled = false;
-                    statusDiv.textContent = '🟢 準備完了。';
-                    vadStatusDiv.textContent = '👂 待機中';
-
-                } catch (err) {
-                    console.error('VAD/Mic エラー:', err);
-                    statusDiv.textContent = 'マイク初期化失敗。';
-                    startButton.disabled = false;
-                }
+                    if (!audioContext || audioContext.state === 'closed') audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                    const audioBuffer = await audioContext.decodeAudioData(wavData);
+                    const source = audioContext.createBufferSource();
+                    source.buffer = audioBuffer;
+                    source.connect(audioContext.destination);
+                    source.onended = () => { isPlaying = false; processAudioQueue(); };
+                    source.start(0);
+                } catch(e) { isPlaying = false; }
             }
 
-            // --- その他 ---
-            function sendAudioAsWav(float32Array) {
-                const wavBuffer = encodeWAV(float32Array, 16000); 
-                ws.send(wavBuffer);
-            }
-            function stopVAD() {
-                vad?.destroy(); 
-                vad = null;
-                mediaStream?.getTracks().forEach(track => track.stop());
-                startButton.disabled = false;
-                stopButton.disabled = true;
-                statusDiv.textContent = '停止中';
-            }
-            function encodeWAV(samples, sampleRate) {
-                const buffer = new ArrayBuffer(44 + samples.length * 2);
-                const view = new DataView(buffer);
-                writeString(view, 0, 'RIFF');
-                view.setUint32(4, 36 + samples.length * 2, true);
-                writeString(view, 8, 'WAVE');
-                writeString(view, 12, 'fmt ');
-                view.setUint32(16, 16, true);
-                view.setUint16(20, 1, true); 
-                view.setUint16(22, 1, true); 
-                view.setUint32(24, sampleRate, true);
-                view.setUint32(28, sampleRate * 2, true);
-                view.setUint16(32, 2, true);
-                view.setUint16(34, 16, true);
-                writeString(view, 36, 'data');
-                view.setUint32(40, samples.length * 2, true);
-                floatTo16BitPCM(view, 44, samples);
-                return view;
-            }
-            function writeString(view, offset, string) {
-                for (let i = 0; i < string.length; i++) {
-                    view.setUint8(offset + i, string.charCodeAt(i));
-                }
-            }
-            function floatTo16BitPCM(output, offset, input) {
-                for (let i = 0; i < input.length; i++, offset += 2) {
-                    let s = Math.max(-1, Math.min(1, input[i]));
-                    s = s < 0 ? s * 0x8000 : s * 0x7FFF;
-                    output.setInt16(offset, s, true);
-                }
-            }
-
-            startButton.onclick = async () => {
-                await initAudioContext(); 
-                await setupVAD();         
-            };
-            
-            stopButton.onclick = stopVAD;
-            window.onload = connectWebSocket;
+            btnStart.onclick = startRecording;
+            btnStop.onclick = stopRecording;
         </script>
     </body>
     </html>
@@ -637,5 +482,4 @@ async def get_root():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
-    logger.info(f"サーバーを http://0.0.0.0:{port} で起動します。")
-    uvicorn.run(app, host="0.0.0.0", port=port, log_config=None)
+    uvicorn.run(app, host="0.0.0.0", port=port)

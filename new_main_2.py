@@ -209,12 +209,11 @@ async def websocket_endpoint(websocket: WebSocket):
     # VADイテレータの初期化
     vad_iterator = VADIterator(vad_model)
     
-    # 音声バッファ
+    # 会話用バッファ
     audio_buffer = [] 
     is_speaking = False
     
-    # Silero VAD 定数
-    # 16000Hzの場合、Sileroは必ず 512 サンプル (約32ms) ずつ入力する必要があります
+    # Silero VAD 定数 (16kHz)
     WINDOW_SIZE_SAMPLES = 512 
     SAMPLE_RATE = 16000
 
@@ -222,36 +221,31 @@ async def websocket_endpoint(websocket: WebSocket):
 
     try:
         while True:
-            # 1. クライアントからデータ受信 (4096サンプル想定)
+            # 1. クライアントから受信 (4096サンプル)
             data_bytes = await websocket.receive_bytes()
             
-            # ★修正1: .copy() を追加して書き込み可能にする (Warning対策)
+            # Warning対策: .copy() で書き込み可能にする
             audio_chunk_np = np.frombuffer(data_bytes, dtype=np.float32).copy()
             
-            # ★修正2: 4096サンプルを 512サンプルずつに分割してVADにかける
-            # フロントエンドからは 4096 ずつ来るので、8回ループします
-            
+            # 2. 512サンプルずつに分割して処理
             offset = 0
-            while offset < len(audio_chunk_np):
-                # 512サンプル切り出し
+            while offset + WINDOW_SIZE_SAMPLES <= len(audio_chunk_np):
+                # 切り出し (512サンプル)
                 window_np = audio_chunk_np[offset : offset + WINDOW_SIZE_SAMPLES]
                 offset += WINDOW_SIZE_SAMPLES
                 
-                # 半端なサイズ（最後など）はVADエラーになるのでスキップ
-                if len(window_np) < WINDOW_SIZE_SAMPLES:
-                    break
+                # ★修正: .unsqueeze(0) を追加して (1, 512) の形状にする
+                # torch.from_numpy(window_np) -> (512,)
+                # .unsqueeze(0) -> (1, 512)
+                window_tensor = torch.from_numpy(window_np).unsqueeze(0).to(DEVICE)
 
-                # Tensor変換
-                window_tensor = torch.from_numpy(window_np).to(DEVICE)
-
-                # --- VAD 判定 (512サンプル単位) ---
+                # --- VAD 判定 ---
                 speech_dict = await asyncio.to_thread(vad_iterator, window_tensor, return_seconds=True)
                 
                 if "start" in speech_dict:
                     logger.info("🗣️ [VAD] Speech STARTED")
                     is_speaking = True
                     await websocket.send_json({"status": "processing", "message": "聞いています..."})
-                    # バッファリセット (今の断片からスタート)
                     audio_buffer = [window_np] 
                 
                 elif "end" in speech_dict:
@@ -260,21 +254,17 @@ async def websocket_endpoint(websocket: WebSocket):
                         is_speaking = False
                         audio_buffer.append(window_np)
                         
-                        # --- 発話確定: 処理開始 ---
                         full_audio = np.concatenate(audio_buffer)
                         
-                        # 短すぎる音声（0.2秒以下）はノイズとして無視
+                        # ノイズ除去 (0.2秒未満は無視)
                         if len(full_audio) / SAMPLE_RATE < 0.2:
                             logger.info("Noise detected (too short), ignoring.")
-                            audio_buffer = []
                         else:
-                            # パイプライン処理へ
                             await process_voice_pipeline(full_audio, websocket, chat_history)
                         
-                        audio_buffer = [] # クリア
+                        audio_buffer = [] 
                 
                 elif is_speaking:
-                    # 話している最中なら、この512サンプルの断片をバッファに追加
                     audio_buffer.append(window_np)
 
     except WebSocketDisconnect:

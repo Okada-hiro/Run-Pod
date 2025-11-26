@@ -518,8 +518,8 @@ async def get_root():
                     
                     mediaStream = await navigator.mediaDevices.getUserMedia({ 
                         audio: {
-                            echoCancellation: true,
-                            noiseSuppression: true,
+                            echoCancellation: false,
+                            noiseSuppression: false,
                             autoGainControl: false
                         } 
                     });
@@ -529,7 +529,7 @@ async def get_root():
                         
                         // ★感度高め
                         positiveSpeechThreshold: 0.8, 
-                        minSpeechFrames: 4,
+                        minSpeechFrames: 2,
                         
                         // ★重要修正: 余韻を極限まで削る (3フレーム≒約0.1秒)
                         // これで話し終わった瞬間に送信されます
@@ -542,7 +542,7 @@ async def get_root():
                         // ★★★ 追加修正: 話し終わりの基準を厳しくする ★★★
                         // これを設定しないと、雑音がある限り録音が止まりません。
                         // 0.6〜0.65 に設定することで、声が弱まった瞬間に「終わり」とみなします。
-                        negativeSpeechThreshold: 0.65,
+                        negativeSpeechThreshold: 0.7,
 
                         onnxWASMBasePath: "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/",
                         baseAssetPath: "https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.29/dist/",

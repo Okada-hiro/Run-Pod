@@ -36,6 +36,11 @@ try:
     from new_text_to_speech import synthesize_speech
 except ImportError as e:
     print(f"[ERROR] 必要なモジュールが見つかりません: {e}")
+
+
+# JIT profiling を無効化しない（=有効のまま）にする
+os.environ["SPEECHBRAIN_DISABLE_JIT_PROFILING"] = "0"
+
 from speaker_filter import SpeakerGuard
 speaker_guard = SpeakerGuard()
 # --- 設定 ---

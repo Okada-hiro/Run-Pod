@@ -206,82 +206,84 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     logger.info("[WS] Client Connected. Starting VAD Stream.")
     
-    # VADイテレータの初期化
+    # 接続ごとにVADのステート（状態）を持つ必要があります
     vad_iterator = VADIterator(vad_model)
     
     # 音声バッファ
-    audio_buffer = [] 
+    audio_buffer = [] # 話している最中のデータを溜めるリスト
     is_speaking = False
     
-    # Silero VAD 定数
-    # 16000Hzの場合、Sileroは必ず 512 サンプル (約32ms) ずつ入力する必要があります
-    WINDOW_SIZE_SAMPLES = 512 
-    SAMPLE_RATE = 16000
-
     chat_history = []
+    
+    # サンプリングレート設定 (Sileroは16k推奨)
+    SAMPLE_RATE = 16000
+    # Silero VAD window size (512 samples = 32ms at 16k)
+    WINDOW_SIZE = 512 
 
     try:
         while True:
-            # 1. クライアントからデータ受信 (4096サンプル想定)
+            # 1. クライアントからRaw PCM (Float32) を受信
+            # フロントエンドは 16000Hz, Mono, Float32 のRawデータを送ってくる前提
             data_bytes = await websocket.receive_bytes()
             
-            # ★修正1: .copy() を追加して書き込み可能にする (Warning対策)
-            audio_chunk_np = np.frombuffer(data_bytes, dtype=np.float32).copy()
+            # バイト列を numpy float32 に変換
+            audio_chunk_np = np.frombuffer(data_bytes, dtype=np.float32)
             
-            # ★修正2: 4096サンプルを 512サンプルずつに分割してVADにかける
-            # フロントエンドからは 4096 ずつ来るので、8回ループします
+            # Silero用 Tensor変換
+            audio_chunk_tensor = torch.from_numpy(audio_chunk_np).to(DEVICE)
+
+            # --- VAD 処理 ---
+            # VADIteratorは内部でステートフルに判定を行います
+            # return_seconds=True にするとタイムスタンプを返しますが、今回は辞書チェックのみ使用
+            speech_dict = await asyncio.to_thread(vad_iterator, audio_chunk_tensor, return_seconds=True)
             
-            offset = 0
-            while offset < len(audio_chunk_np):
-                # 512サンプル切り出し
-                window_np = audio_chunk_np[offset : offset + WINDOW_SIZE_SAMPLES]
-                offset += WINDOW_SIZE_SAMPLES
-                
-                # 半端なサイズ（最後など）はVADエラーになるのでスキップ
-                if len(window_np) < WINDOW_SIZE_SAMPLES:
-                    break
+            # 現在のチャンクをバッファに追加 (会話として保存するため)
+            # ※ VAD判定に関わらず、トリガー前後の音声も少し含めるためにバッファリング戦略が必要ですが
+            #    SileroのIteratorは内部でうまくやってくれるので、ここではシンプルに
+            #    「is_speakingなら溜める」戦略をとります。
+            
+            if "start" in speech_dict:
+                logger.info("🗣️ [VAD] Speech STARTED")
+                is_speaking = True
+                await websocket.send_json({"status": "processing", "message": "聞いています..."})
+                # バッファリセット (開始時点からの音声を溜める)
+                # ※本当はプリロール（少し前の音）も含めたいですが、Iteratorの特性上、
+                # startが返った時点で内部バッファはクリアされていることが多いです。
+                audio_buffer = [audio_chunk_np] 
+            
+            elif "end" in speech_dict:
+                logger.info("🤫 [VAD] Speech ENDED")
+                if is_speaking:
+                    is_speaking = False
+                    audio_buffer.append(audio_chunk_np)
+                    
+                    # --- 発話確定: 処理開始 ---
+                    # 1. 結合
+                    full_audio = np.concatenate(audio_buffer)
+                    
+                    # 短すぎる音声（ノイズ）は無視
+                    if len(full_audio) / SAMPLE_RATE < 0.2:
+                        logger.info("Noise detected (too short), ignoring.")
+                        audio_buffer = []
+                        continue
 
-                # Tensor変換
-                window_tensor = torch.from_numpy(window_np).to(DEVICE)
-
-                # --- VAD 判定 (512サンプル単位) ---
-                speech_dict = await asyncio.to_thread(vad_iterator, window_tensor, return_seconds=True)
-                
-                if "start" in speech_dict:
-                    logger.info("🗣️ [VAD] Speech STARTED")
-                    is_speaking = True
-                    await websocket.send_json({"status": "processing", "message": "聞いています..."})
-                    # バッファリセット (今の断片からスタート)
-                    audio_buffer = [window_np] 
-                
-                elif "end" in speech_dict:
-                    logger.info("🤫 [VAD] Speech ENDED")
-                    if is_speaking:
-                        is_speaking = False
-                        audio_buffer.append(window_np)
-                        
-                        # --- 発話確定: 処理開始 ---
-                        full_audio = np.concatenate(audio_buffer)
-                        
-                        # 短すぎる音声（0.2秒以下）はノイズとして無視
-                        if len(full_audio) / SAMPLE_RATE < 0.2:
-                            logger.info("Noise detected (too short), ignoring.")
-                            audio_buffer = []
-                        else:
-                            # パイプライン処理へ
-                            await process_voice_pipeline(full_audio, websocket, chat_history)
-                        
-                        audio_buffer = [] # クリア
-                
-                elif is_speaking:
-                    # 話している最中なら、この512サンプルの断片をバッファに追加
-                    audio_buffer.append(window_np)
+                    # 2. 非同期タスクとしてバックエンド処理へ投げる
+                    # (awaitすると次の音声受信がブロックされるため、本来はcreate_task推奨だが
+                    #  会話の順番を守るため今回はawaitします)
+                    await process_voice_pipeline(full_audio, websocket, chat_history)
+                    
+                    audio_buffer = [] # クリア
+            
+            elif is_speaking:
+                # 話している最中ならひたすら溜める
+                audio_buffer.append(audio_chunk_np)
 
     except WebSocketDisconnect:
         logger.info("[WS] Disconnected")
     except Exception as e:
         logger.error(f"[WS ERROR] {e}", exc_info=True)
     finally:
+        # VADリセット
         vad_iterator.reset_states()
 
 

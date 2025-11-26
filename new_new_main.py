@@ -153,7 +153,7 @@ async def process_audio_file(audio_path: str, original_filename: str, websocket:
         text_buffer = ""
         sentence_count = 0
         full_answer_log = ""
-        split_pattern = r'(?<=[。！？\n])'
+        split_pattern = r'(?<=[。！？\n、])'
 
         iterator = generate_answer_stream(question_text, history=chat_history)
 

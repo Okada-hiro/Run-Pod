@@ -39,7 +39,7 @@ except ImportError as e:
 # JIT profiling を無効化しない（=有効のまま）にする
 os.environ["SPEECHBRAIN_DISABLE_JIT_PROFILING"] = "0"
 
-from speaker_filter import SpeakerGuard
+from new_speaker_filter import SpeakerGuard
 speaker_guard = SpeakerGuard()
 
 # --- 設定 ---

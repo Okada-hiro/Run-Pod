@@ -539,6 +539,11 @@ async def get_root():
                         // これで送信データ量とサーバー負荷を減らします
                         preSpeechPadFrames: 5,
 
+                        // ★★★ 追加修正: 話し終わりの基準を厳しくする ★★★
+                        // これを設定しないと、雑音がある限り録音が止まりません。
+                        // 0.6〜0.65 に設定することで、声が弱まった瞬間に「終わり」とみなします。
+                        negativeSpeechThreshold: 0.65,
+
                         onnxWASMBasePath: "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/",
                         baseAssetPath: "https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.29/dist/",
                         

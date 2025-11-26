@@ -1,4 +1,4 @@
-# /workspace/new_new_main.py (完全修正版: Web Audio API対応 + 高速化 + メンバー追加機能)
+# /workspace/new_new_main.py (完全修正版: Web Audio API対応)
 import uvicorn
 from fastapi import FastAPI, WebSocket, Request
 from fastapi.responses import HTMLResponse, FileResponse
@@ -12,6 +12,9 @@ import sys
 from pydub import AudioSegment
 import io
 import re
+
+
+
 
 # --- ロギング設定 ---
 logging.basicConfig(
@@ -38,29 +41,16 @@ except ImportError as e:
 # JIT profiling を無効化しない（=有効のまま）にする
 os.environ["SPEECHBRAIN_DISABLE_JIT_PROFILING"] = "0"
 
-from new_speaker_filter import SpeakerGuard
+from speaker_filter import SpeakerGuard
 speaker_guard = SpeakerGuard()
-
 # --- 設定 ---
 PROCESSING_DIR = "incoming_audio" 
 LANGUAGE = "ja"
-
-# ★追加: 次の音声を登録モードとして扱うかのフラグ
-NEXT_AUDIO_IS_REGISTRATION = False
 
 # --- アプリケーション初期化 ---
 app = FastAPI()
 os.makedirs(PROCESSING_DIR, exist_ok=True)
 app.mount(f"/download", StaticFiles(directory=PROCESSING_DIR), name="download")
-
-
-# ★追加: 登録モード有効化のエンドポイント
-@app.post("/enable-registration")
-async def enable_registration():
-    global NEXT_AUDIO_IS_REGISTRATION
-    NEXT_AUDIO_IS_REGISTRATION = True
-    logger.info("【モード切替】次の音声を新規話者として登録します")
-    return {"message": "登録モード待機中"}
 
 
 # ---------------------------
@@ -113,37 +103,16 @@ async def process_sentence(text: str, base_filename: str, index: int, websocket:
 # 2. バックグラウンド処理 (メインフロー)
 # ---------------------------
 async def process_audio_file(audio_path: str, original_filename: str, websocket: WebSocket, chat_history: list):
-    global NEXT_AUDIO_IS_REGISTRATION
     logger.info(f"[TASK START] ファイル処理開始: {original_filename}")
-    
-    # --- ★★★ 話者判定・登録ロジック (修正版) ★★★ ---
-    
-    # パターンA: 登録モードの場合
-    if NEXT_AUDIO_IS_REGISTRATION:
-        logger.info("[REGISTRATION] 新規話者登録を実行中...")
-        
-        # speaker_filter.py に register_new_speaker メソッドが実装されている前提
-        success = await asyncio.to_thread(speaker_guard.register_new_speaker, audio_path)
-        
-        # フラグを戻す
-        NEXT_AUDIO_IS_REGISTRATION = False
-        
-        if success:
-            await websocket.send_json({"status": "ignored", "message": "✅ 新しいメンバーを登録しました！"})
-        else:
-            await websocket.send_json({"status": "error", "message": "登録に失敗しました"})
-        return  # 登録だけして会話はせず終了
-
-    # パターンB: 通常会話モード (本人確認)
-    # speaker_filter.py の is_owner がリスト対応している前提
+    # ★★★ ここに追加: 話者判定 ★★★
+    # 本人じゃなければ即終了 (WhisperもLLMも回さない)
     is_owner = await asyncio.to_thread(speaker_guard.is_owner, audio_path)
     
     if not is_owner:
-        logger.info("[TASK] 未登録の話者のため無視しました")
-        await websocket.send_json({"status": "ignored", "message": "🚫 未登録の声です"})
+        logger.info("[TASK] 他人の声のため無視しました")
+        await websocket.send_json({"status": "ignored", "message": "（他人の声を無視）"})
         return 
-    # --------------------------------------------------
-
+    # ★★★ ここまで ★★★
     try:
         # --- 文字起こし ---
         output_txt_path = os.path.join(PROCESSING_DIR, original_filename + ".txt")
@@ -265,7 +234,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
 
 # ---------------------------
-# 4. フロントエンド (修正版 HTML/JS)
+# 4. フロントエンド (修正版 HTML/JS - Web Audio API版)
 # ---------------------------
 @app.get("/", response_class=HTMLResponse)
 async def get_root():
@@ -275,7 +244,7 @@ async def get_root():
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device.width, initial-scale=1.0">
-        <title>AI Voice Talk (Multi-User & Fast VAD)</title>
+        <title>AI Voice Talk (Web Audio API)</title>
         
         <style>
             body { font-family: sans-serif; display: grid; place-items: center; min-height: 90vh; background: #f0f2f5; }
@@ -292,8 +261,6 @@ async def get_root():
             
             #startButton { background: #007bff; }
             #stopButton { background: #6c757d; }
-            /* 追加ボタン用スタイル */
-            #addSpeakerButton { background: #28a745; font-size: 0.9rem; padding: 0.6rem 1.2rem; }
 
             #status { margin-top: 1.5rem; font-size: 1.1rem; color: #333; min-height: 1.5em; font-weight: bold; }
             #vad-status { font-size: 0.9rem; color: #666; height: 1.5em; margin-bottom: 10px;}
@@ -324,10 +291,6 @@ async def get_root():
                 <button id="stopButton" disabled>マイクOFF</button>
             </div>
             
-            <div style="margin-top: 10px;">
-                <button id="addSpeakerButton">＋ メンバーを追加</button>
-            </div>
-            
             <div id="status">準備完了</div>
             <div id="vad-status">(待機中)</div>
             
@@ -341,7 +304,6 @@ async def get_root():
             // --- グローバル変数 ---
             const startButton = document.getElementById('startButton');
             const stopButton = document.getElementById('stopButton');
-            const addSpeakerBtn = document.getElementById('addSpeakerButton'); // 追加
             const statusDiv = document.getElementById('status');
             const vadStatusDiv = document.getElementById('vad-status');
             const qaDisplay = document.getElementById('qa-display');
@@ -424,78 +386,76 @@ async def get_root():
                         qaDisplay.scrollTop = qaDisplay.scrollHeight;
                     }
                 } else if (data.status === 'ignored') {
-                    statusDiv.textContent = data.message;
-                    // 必要ならバブルにも表示
-                    if (currentAnswerId) {
-                         const div = document.getElementById(currentAnswerId);
-                         if(div) div.textContent += " " + data.message;
-                    }
+                    statusDiv.textContent = "(音声を無視しました)";
+                    const div = document.getElementById(currentAnswerId);
+                    if(div) div.textContent = "(応答なし)";
                 } else if (data.status === 'error') {
                     statusDiv.textContent = `エラー: ${data.message}`;
                 }
             }
-            
-            // ★追加: メンバー追加ボタン処理
-            addSpeakerBtn.onclick = async () => {
-                try {
-                    await fetch('/enable-registration', { method: 'POST' });
-                    statusDiv.textContent = '🆕 次に話す人を登録します。新しい人が何か話してください...';
-                    statusDiv.style.color = '#28a745';
-                    appendBubble('ai', '新しいメンバーの方、登録しますので何か話しかけてください。', `sys-${Date.now()}`);
-                } catch (e) {
-                    console.error(e);
-                    statusDiv.textContent = 'エラー: 登録モードに失敗';
-                }
-            };
 
-            // --- 3. Web Audio API 初期化 ---
+            // --- 3. Web Audio API 初期化 (最重要) ---
+            // ボタンクリック時に1回だけ呼び出し、コンテキストを「再開(resume)」状態にする
             async function initAudioContext() {
                 if (!audioCtx) {
                     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
                 }
+                
+                // ブラウザによってサスペンドされている場合は再開させる
                 if (audioCtx.state === 'suspended') {
                     await audioCtx.resume();
                 }
+
+                // 無音を再生して確実にロック解除する
                 const buffer = audioCtx.createBuffer(1, 1, 22050);
                 const source = audioCtx.createBufferSource();
                 source.buffer = buffer;
                 source.connect(audioCtx.destination);
                 source.start(0);
-                console.log("🔊 AudioContext unlocked:", audioCtx.state);
+                
+                console.log("🔊 AudioContext unlocked/resumed:", audioCtx.state);
             }
 
-            // --- 4. 音声再生ロジック ---
+            // --- 4. 音声再生ロジック (Web Audio API版) ---
             function processAudioQueue() {
                 if (isPlaying) return;
                 if (audioQueue.length === 0) return;
+                
                 const nextBlob = audioQueue.shift();
                 playAudioBlob(nextBlob);
             }
 
             async function playAudioBlob(blob) {
-                if (!audioCtx) return; 
+                if (!audioCtx) return; // 初期化前なら無視
+
                 isPlaying = true;
                 statusDiv.textContent = '🔊 AI回答中...';
 
                 try {
+                    // Blob -> ArrayBuffer -> AudioBuffer
                     const arrayBuffer = await blob.arrayBuffer();
                     const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+
                     const source = audioCtx.createBufferSource();
                     source.buffer = audioBuffer;
                     source.connect(audioCtx.destination);
-                    currentSource = source; 
+                    
+                    currentSource = source; // 中断できるように保存
 
                     source.onended = () => {
                         isPlaying = false;
                         currentSource = null;
                         processAudioQueue();
+                        
                         if (audioQueue.length === 0) {
                             statusDiv.textContent = '🟢 完了。次の質問をどうぞ。';
                         }
                     };
+
                     source.start(0);
+                    
                 } catch (e) {
-                    console.error("再生エラー:", e);
+                    console.error("再生エラー(decode/play):", e);
                     isPlaying = false;
                     processAudioQueue();
                 }
@@ -503,21 +463,24 @@ async def get_root():
 
             // --- 5. 割り込み処理 ---
             function interruptAudio() {
+                // 再生中のソースを停止
                 if (currentSource) {
                     try { currentSource.stop(); } catch(e){}
                     currentSource = null;
                 }
+                
                 audioQueue = [];
                 isPlaying = false;
                 ignoreIncomingAudio = true;
                 statusDiv.textContent = '⛔ 中断。あなたの声を聞いています。';
+                
                 if (currentAnswerId) {
                     const div = document.getElementById(currentAnswerId);
                     if (div) div.textContent += " (中断)";
                 }
             }
 
-            // --- 6. VAD & マイク設定 (高速化版) ---
+            // --- 6. VAD & マイク設定 ---
             async function setupVAD() {
                 try {
                     startButton.disabled = true;
@@ -535,11 +498,13 @@ async def get_root():
                     
                     vad = await window.vad.MicVAD.new({
                         stream: mediaStream,
-                        // ★修正: 感度を上げて反応を良くする
-                        positiveSpeechThreshold: 0.8, 
+                        positiveSpeechThreshold: 0.9, // 誤検知防止で少し高め
                         minSpeechFrames: 4,
-                        // ★修正: 余韻を短くして即送信 (約0.25秒)
-                        redemptionFrames: 8, 
+                        // 【重要】話し終わりの余韻 (ここを短くするとレスポンスが早くなる)
+                        // デフォルトはもう少し長いですが、ここを減らすと「話し終わり」を即断します。
+                        // 1フレーム ≈ 30ms～96ms (モデルによる)。
+                        // 8フレーム程度に設定すると、一呼吸置いた瞬間に送信されます。
+                        redemptionFrames: 8,
                         preSpeechPadFrames: 20,
                         onnxWASMBasePath: "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/",
                         baseAssetPath: "https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.29/dist/",
@@ -548,7 +513,7 @@ async def get_root():
                             isSpeaking = true;
                             vadStatusDiv.textContent = "🗣️ 感知中...";
                             if (isPlaying || audioQueue.length > 0) {
-                                interruptAudio(); 
+                                interruptAudio(); // 割り込み
                             }
                         },
                         
@@ -620,9 +585,10 @@ async def get_root():
                 }
             }
 
+            // ★ボタンクリックでAudioContext初期化とVAD起動を同時に行う
             startButton.onclick = async () => {
-                await initAudioContext(); 
-                await setupVAD();         
+                await initAudioContext(); // オーディオエンジンの起動
+                await setupVAD();         // マイクの起動
             };
             
             stopButton.onclick = stopVAD;

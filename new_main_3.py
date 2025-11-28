@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 # --- 必要なモジュールのインポート ---
 try:
     from transcribe_func import GLOBAL_ASR_MODEL_INSTANCE
-    from supporter_generator import generate_answer_stream
+    from supporter_generator_1 import generate_answer_stream
     from new_text_to_speech import synthesize_speech
     from speaker_filter import SpeakerGuard
 except ImportError as e:

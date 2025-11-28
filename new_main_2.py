@@ -1,5 +1,5 @@
 # /workspace/new_main_2.py
-# 二つのモデルを使う
+# Fixed: Subtitle Order (User first, then AI) & Toast Position (Bottom)
 
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -28,7 +28,7 @@ try:
     from transcribe_func import GLOBAL_ASR_MODEL_INSTANCE
     from supporter_generator import generate_answer_stream, generate_quick_ack
     from new_text_to_speech import synthesize_speech
-    from speaker_filter import SpeakerGuard
+    from new_speaker_filter import SpeakerGuard
 except ImportError as e:
     logger.error(f"[ERROR] 必要なモジュールが見つかりません: {e}")
     sys.exit(1)
@@ -73,7 +73,7 @@ async def enable_registration():
     return {"message": "登録モード待機中"}
 
 
-# --- ヘルパー: 音声処理パイプライン (字幕ON版) ---
+# --- ヘルパー: 音声処理パイプライン ---
 async def process_voice_pipeline(audio_float32_np, websocket: WebSocket, chat_history: list):
     global NEXT_AUDIO_IS_REGISTRATION
     
@@ -132,6 +132,14 @@ async def process_voice_pipeline(audio_float32_np, websocket: WebSocket, chat_hi
         text_with_context = f"【{speaker_id}】 {text}"
         logger.info(f"[TASK] {text_with_context}")
         
+        # --- ★★★ [修正点1] ユーザーの字幕を「先に」送信する ★★★ ---
+        # これにより、UI上で「ユーザー発言」→「AI相槌」の正しい順序になります
+        await websocket.send_json({
+            "status": "transcribed",
+            "question_text": text,
+            "speaker_id": speaker_id 
+        })
+
         # --- ★★★ Phase A: 相槌 (Lite) ★★★ ---
         logger.info("🚀 [Lite] Generating Aizuchi...")
         ack_text = await asyncio.to_thread(generate_quick_ack, text)
@@ -139,9 +147,7 @@ async def process_voice_pipeline(audio_float32_np, websocket: WebSocket, chat_hi
         if ack_text:
             logger.info(f"🚀 [Lite] Aizuchi: {ack_text}")
             
-            # ★ ここで字幕（テキスト）を送信！
-            # メイン回答と同じ吹き出しに追加されるよう "reply_chunk" を使用します。
-            # 読みやすくするために末尾に改行かスペースを入れると良いです。
+            # AIの相槌字幕を表示
             await websocket.send_json({
                 "status": "reply_chunk", 
                 "text_chunk": ack_text + "\n" 
@@ -156,11 +162,7 @@ async def process_voice_pipeline(audio_float32_np, websocket: WebSocket, chat_hi
                 await websocket.send_bytes(ack_bytes)
         
         # --- ★★★ Phase B: 本回答 (Main) ★★★ ---
-        await websocket.send_json({
-            "status": "transcribed",
-            "question_text": text,
-            "speaker_id": speaker_id 
-        })
+        # ユーザー字幕送信はすでに上で完了しているのでここでは不要
 
         await handle_llm_tts(text_with_context, websocket, chat_history)
 
@@ -248,7 +250,7 @@ async def websocket_endpoint(websocket: WebSocket):
     
     WINDOW_SIZE_SAMPLES = 512 
     SAMPLE_RATE = 16000
-    CHECK_SPEAKER_SAMPLES = 30000 
+    CHECK_SPEAKER_SAMPLES = 24000 
     
     chat_history = []
 
@@ -313,7 +315,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
 
 # ---------------------------
-# フロントエンド (そのまま)
+# フロントエンド (CSS修正版)
 # ---------------------------
 @app.get("/", response_class=HTMLResponse)
 async def get_root():
@@ -374,15 +376,17 @@ async def get_root():
                 box-shadow: 0 2px 5px rgba(0,0,0,0.3);
             }
 
+            /* --- ★★★ [修正点2] Toastの位置を下部(黒いエリア)へ変更 ★★★ --- */
             #toast-container {
                 position: absolute;
-                top: 70px; 
+                top: auto;        /* 上部指定を解除 */
+                bottom: 20px;     /* 下から20px (コントロールパネル付近) */
                 left: 50%;
                 transform: translateX(-50%);
                 z-index: 100;
                 width: 90%;
                 max-width: 400px;
-                pointer-events: none; 
+                pointer-events: none; /* 下にあってもボタンを押せるように透過 */
             }
             .toast {
                 background: rgba(30, 30, 30, 0.95);
@@ -398,10 +402,11 @@ async def get_root():
                 gap: 8px;
                 opacity: 0;
                 animation: slideDown 0.3s forwards, fadeOut 0.5s forwards 2.5s; 
-                pointer-events: auto;
+                pointer-events: auto; /* ボタンは押せるようにする */
             }
             
-            @keyframes slideDown { from { transform: translateY(-20px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+            /* 下から出るのでアニメーション方向も逆にすると自然 */
+            @keyframes slideDown { from { transform: translateY(20px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
             @keyframes fadeOut { from { opacity: 1; } to { opacity: 0; visibility: hidden; } }
 
             .toast-btn {

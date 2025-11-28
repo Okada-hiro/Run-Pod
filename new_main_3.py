@@ -1,4 +1,5 @@
-#new_main_2.pyからの進化系 割り込みができる
+# /workspace/new_main_2.py
+# Server-Side VAD + Streaming + Speaker ID + System Alerts (Yellow Warnings)
 
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -26,7 +27,7 @@ try:
     from transcribe_func import GLOBAL_ASR_MODEL_INSTANCE
     from supporter_generator import generate_answer_stream
     from new_text_to_speech import synthesize_speech
-    from new_speaker_filter import SpeakerGuard
+    from speaker_filter import SpeakerGuard
 except ImportError as e:
     logger.error(f"[ERROR] 必要なモジュールが見つかりません: {e}")
     sys.exit(1)
@@ -74,39 +75,50 @@ async def enable_registration():
 async def process_voice_pipeline(audio_float32_np, websocket: WebSocket, chat_history: list):
     global NEXT_AUDIO_IS_REGISTRATION
     
-    # SpeakerGuard用に Tensor化 (1, samples)
+    # SpeakerGuard用に Tensor化
     voice_tensor = torch.from_numpy(audio_float32_np).float().unsqueeze(0)
+    
+    speaker_id = "Unknown"
+    is_allowed = False
 
     # ---------------------------
-    # 0. 話者登録モード
+    # 1. 話者判定 / 登録ロジック
     # ---------------------------
     if NEXT_AUDIO_IS_REGISTRATION:
         temp_reg_path = f"{PROCESSING_DIR}/reg_{id(audio_float32_np)}.wav"
         import soundfile as sf
         sf.write(temp_reg_path, audio_float32_np, 16000)
         
-        success = await asyncio.to_thread(speaker_guard.register_new_speaker, temp_reg_path)
-        NEXT_AUDIO_IS_REGISTRATION = False
+        new_id = await asyncio.to_thread(speaker_guard.register_new_speaker, temp_reg_path)
+        NEXT_AUDIO_IS_REGISTRATION = False 
         
-        if success:
-            await websocket.send_json({"status": "ignored", "message": "✅ 新しいメンバーを登録しました！"})
+        if new_id:
+            speaker_id = new_id
+            is_allowed = True
+            await websocket.send_json({"status": "system_info", "message": f"✅ {new_id} を登録しました！会話を続けます。"})
         else:
             await websocket.send_json({"status": "error", "message": "登録に失敗しました"})
-        return
+            return
+            
+    else:
+        is_allowed, detected_id = await asyncio.to_thread(speaker_guard.identify_speaker, voice_tensor)
+        speaker_id = detected_id
 
     # ---------------------------
-    # 1. 話者認識 (最終確認)
+    # 2. アクセス制御 (SpeakerGuard)
     # ---------------------------
-    # ※ 割り込み判定ですでにOKが出ている場合も多いが、念のため全データで最終確認
-    is_allowed = await asyncio.to_thread(speaker_guard.verify_tensor, voice_tensor)
-
     if not is_allowed:
-        logger.info("[Access Denied] 登録されていない話者です（最終判定）。")
-        await websocket.send_json({"status": "ignored", "message": "🚫 未登録の声です (ブロック)"})
+        logger.info("[Access Denied] 登録されていない話者です。")
+        # ★ ここを変更: system_alert を送信
+        await websocket.send_json({
+            "status": "system_alert", 
+            "message": "⚠️ 外部の会話(未登録)を検知しました。会話を続けてください。",
+            "alert_type": "warning"
+        })
         return
 
     # ---------------------------
-    # 2. Whisper 文字起こし
+    # 3. Whisper 文字起こし
     # ---------------------------
     try:
         if GLOBAL_ASR_MODEL_INSTANCE is None:
@@ -124,16 +136,19 @@ async def process_voice_pipeline(audio_float32_np, websocket: WebSocket, chat_hi
             logger.info("[TASK] 空の認識結果")
             return
 
-        logger.info(f"[TASK] テキスト: {text}")
+        text_with_context = f"【{speaker_id}】 {text}"
+        logger.info(f"[TASK] {text_with_context}")
+
         await websocket.send_json({
             "status": "transcribed",
-            "question_text": text
+            "question_text": text,
+            "speaker_id": speaker_id 
         })
 
         # ---------------------------
-        # 3. LLM & TTS ストリーミング
+        # 4. LLM & TTS ストリーミング
         # ---------------------------
-        await handle_llm_tts(text, websocket, chat_history)
+        await handle_llm_tts(text_with_context, websocket, chat_history)
 
     except Exception as e:
         logger.error(f"Pipeline Error: {e}", exc_info=True)
@@ -141,14 +156,13 @@ async def process_voice_pipeline(audio_float32_np, websocket: WebSocket, chat_hi
 
 
 # --- ヘルパー: 回答生成と音声合成 ---
-async def handle_llm_tts(text: str, websocket: WebSocket, chat_history: list):
+async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: list):
     text_buffer = ""
     sentence_count = 0
     full_answer = ""
     split_pattern = r'(?<=[。！？\n、])'
 
-    # 生成開始
-    iterator = generate_answer_stream(text, history=chat_history)
+    iterator = generate_answer_stream(text_for_llm, history=chat_history)
 
     async def send_audio_chunk(phrase, idx):
         filename = f"resp_{idx}.wav"
@@ -157,23 +171,23 @@ async def handle_llm_tts(text: str, websocket: WebSocket, chat_history: list):
         if success:
             with open(path, 'rb') as f:
                 wav_data = f.read()
-            # 音声データを送信
             try:
                 await websocket.send_bytes(wav_data)
             except RuntimeError:
-                # 接続が切れている場合など
                 pass
 
     try:
         for chunk in iterator:
-            # ★ ここに「新しい割り込み」があった場合のキャンセル処理を入れることも可能だが、
-            # 今回はWebSocketループ側で管理し、クライアントが再生を止める方式を採用する。
-            
             text_buffer += chunk
             full_answer += chunk
             
+            # ★ ここを変更: [SILENCE] の場合の処理
             if full_answer.strip() == "[SILENCE]":
-                await websocket.send_json({"status": "ignored", "message": "（応答なし）"})
+                await websocket.send_json({
+                    "status": "system_alert", 
+                    "message": "⚠️ 会話外の音声と判断しました。続けてください。",
+                    "alert_type": "warning"
+                })
                 return
 
             sentences = re.split(split_pattern, text_buffer)
@@ -181,9 +195,7 @@ async def handle_llm_tts(text: str, websocket: WebSocket, chat_history: list):
                 for sent in sentences[:-1]:
                     if sent.strip():
                         sentence_count += 1
-                        # 字幕送信
                         await websocket.send_json({"status": "reply_chunk", "text_chunk": sent})
-                        # 音声送信
                         await send_audio_chunk(sent, sentence_count)
                 text_buffer = sentences[-1]
         
@@ -192,7 +204,7 @@ async def handle_llm_tts(text: str, websocket: WebSocket, chat_history: list):
             await websocket.send_json({"status": "reply_chunk", "text_chunk": text_buffer})
             await send_audio_chunk(text_buffer, sentence_count)
 
-        chat_history.append({"role": "user", "parts": [text]})
+        chat_history.append({"role": "user", "parts": [text_for_llm]})
         chat_history.append({"role": "model", "parts": [full_answer]})
         
         await websocket.send_json({"status": "complete", "answer_text": full_answer})
@@ -202,7 +214,7 @@ async def handle_llm_tts(text: str, websocket: WebSocket, chat_history: list):
 
 
 # ---------------------------
-# WebSocket エンドポイント (Barge-in対応)
+# WebSocket エンドポイント
 # ---------------------------
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -210,48 +222,42 @@ async def websocket_endpoint(websocket: WebSocket):
     logger.info("[WS] Client Connected.")
     
     vad_iterator = VADIterator(
-    vad_model, 
-    threshold=0.5, 
-    sampling_rate=16000, 
-    min_silence_duration_ms=500, 
-    speech_pad_ms=50
-)
+        vad_model, 
+        threshold=0.5, 
+        sampling_rate=16000, 
+        min_silence_duration_ms=1000, 
+        speech_pad_ms=50
+    )
+
     audio_buffer = [] 
     is_speaking = False
-    interruption_triggered = False # 今回の発話ですでに割り込み指示を出したか
+    interruption_triggered = False 
     
-    # 設定
     WINDOW_SIZE_SAMPLES = 512 
     SAMPLE_RATE = 16000
-    CHECK_SPEAKER_SAMPLES = 12000 # 約0.75秒溜まったら話者チェックする
+    CHECK_SPEAKER_SAMPLES = 12000
     
     chat_history = []
 
     try:
         while True:
-            # 1. 受信
             data_bytes = await websocket.receive_bytes()
             audio_chunk_np = np.frombuffer(data_bytes, dtype=np.float32).copy()
             
-            # 2. 512サンプル分割ループ
             offset = 0
             while offset + WINDOW_SIZE_SAMPLES <= len(audio_chunk_np):
                 window_np = audio_chunk_np[offset : offset + WINDOW_SIZE_SAMPLES]
                 offset += WINDOW_SIZE_SAMPLES
-                
-                # Tensor化 (1, 512)
                 window_tensor = torch.from_numpy(window_np).unsqueeze(0).to(DEVICE)
 
-                # VAD判定
                 speech_dict = await asyncio.to_thread(vad_iterator, window_tensor, return_seconds=True)
                 
                 if speech_dict:
                     if "start" in speech_dict:
                         logger.info("🗣️ Speech START")
                         is_speaking = True
-                        interruption_triggered = False # リセット
+                        interruption_triggered = False 
                         audio_buffer = [window_np]
-                        # UI更新: 聞き取り開始
                         await websocket.send_json({"status": "processing", "message": "👂 聞いています..."})
                     
                     elif "end" in speech_dict:
@@ -259,46 +265,32 @@ async def websocket_endpoint(websocket: WebSocket):
                         if is_speaking:
                             is_speaking = False
                             audio_buffer.append(window_np)
-                            
                             full_audio = np.concatenate(audio_buffer)
                             
-                            # 短すぎるノイズは無視
                             if len(full_audio) / SAMPLE_RATE < 0.2:
-                                logger.info("Noise detected (too short)")
+                                logger.info("Noise detected")
+                                # 短すぎる音も黄色警告にするか、あるいは無視するか。
+                                # ここでは無視（statusバーのみ更新）にしておきます（頻発するとウザいため）
                                 await websocket.send_json({"status": "ignored", "message": "..."})
                             else:
                                 await websocket.send_json({"status": "processing", "message": "🧠 AI思考中..."})
-                                # パイプライン実行（非同期タスクとして投げると並列処理になるが、
-                                # ここでは順次処理でチャットの整合性を保つ）
                                 await process_voice_pipeline(full_audio, websocket, chat_history)
-                            
                             audio_buffer = [] 
-                
                 else:
                     if is_speaking:
                         audio_buffer.append(window_np)
                         
-                        # --- ★★★ バージイン（割り込み）判定ロジック ★★★ ---
-                        # まだ割り込み指示を出しておらず、かつ一定量（0.75秒分など）音声が溜まった場合
                         current_len = sum(len(c) for c in audio_buffer)
-                        
                         if not interruption_triggered and not NEXT_AUDIO_IS_REGISTRATION and current_len > CHECK_SPEAKER_SAMPLES:
-                            # 暫定バッファを結合してチェック
                             temp_audio = np.concatenate(audio_buffer)
                             temp_tensor = torch.from_numpy(temp_audio).float().unsqueeze(0)
                             
-                            # 話者チェック (SpeakerGuard)
-                            is_verified = await asyncio.to_thread(speaker_guard.verify_tensor, temp_tensor)
+                            is_verified, spk_id = await asyncio.to_thread(speaker_guard.identify_speaker, temp_tensor)
                             
                             if is_verified:
-                                logger.info("⚡ [Barge-in] 本人の声を検知！再生停止指示を送信します。")
-                                # クライアントに「音声停止」を指示
+                                logger.info(f"⚡ [Barge-in] {spk_id} の声を検知！停止指示。")
                                 await websocket.send_json({"status": "interrupt", "message": "🛑 音声停止"})
                                 interruption_triggered = True
-                            else:
-                                # 本人ではない(雑音の可能性) -> 割り込み指示を送らない（無視して再生継続）
-                                # ※ただし、最終的にSpeech ENDまで行ったら再度チェックされてブロックされる
-                                pass
 
     except WebSocketDisconnect:
         logger.info("[WS] Disconnected")
@@ -309,7 +301,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
 
 # ---------------------------
-# フロントエンド (字幕修正 & LINE風UI & 割り込み対応)
+# フロントエンド (システム警告UI対応)
 # ---------------------------
 @app.get("/", response_class=HTMLResponse)
 async def get_root():
@@ -319,7 +311,7 @@ async def get_root():
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device.width, initial-scale=1.0">
-        <title>Realtime Voice Chat ⚡</title>
+        <title>Team Chat AI</title>
         <style>
             body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; display: grid; place-items: center; min-height: 90vh; background: #202c33; color: #e9edef; margin: 0; }
             #container { background: #111b21; padding: 0; border-radius: 0; text-align: center; width: 100%; max-width: 600px; height: 100vh; display: flex; flex-direction: column; box-shadow: 0 0 20px rgba(0,0,0,0.5); }
@@ -337,36 +329,55 @@ async def get_root():
                 background-color: #0b141a;
             }
 
-            .row { display: flex; width: 100%; margin-bottom: 8px; }
-            .row.ai { justify-content: flex-start; }
-            .row.user { justify-content: flex-end; }
+            .row { display: flex; width: 100%; margin-bottom: 8px; flex-direction: column; }
+            .row.ai { align-items: flex-start; }
+            .row.user { align-items: flex-end; }
+            /* システムメッセージ用に行全体を中央揃えにする */
+            .row.system { align-items: center; margin-bottom: 12px; }
             
+            .speaker-name { font-size: 0.75rem; color: #8696a0; margin-bottom: 2px; margin-left: 5px; margin-right: 5px;}
+
             .bubble { 
                 padding: 8px 12px; border-radius: 8px; max-width: 75%; 
-                font-size: 0.95rem; line-height: 1.4; position: relative; word-wrap: break-word;
+                font-size: 0.95rem; line-height: 1.4; word-wrap: break-word;
                 box-shadow: 0 1px 0.5px rgba(0,0,0,0.13);
             }
             .ai .bubble { background: #202c33; color: #e9edef; border-top-left-radius: 0; }
-            .user .bubble { background: #005c4b; color: #e9edef; border-top-right-radius: 0; }
             
+            /* ユーザー色分け */
+            .user-type-0 .bubble { background: #005c4b; color: #e9edef; border-top-right-radius: 0; }
+            .user-type-1 .bubble { background: #0078d4; color: #fff; border-top-right-radius: 0; }
+            .user-type-2 .bubble { background: #6b63ff; color: #fff; border-top-right-radius: 0; }
+            .user-type-unknown .bubble { background: #374045; color: #e9edef; border-top-right-radius: 0; }
+            
+            /* ★システム警告用スタイル★ */
+            .system-alert {
+                background: rgba(255, 241, 118, 0.1); /* 背景うっすら黄色 */
+                color: #ffeb3b;                       /* 文字は明るい黄色 */
+                font-size: 0.8rem;
+                padding: 4px 12px;
+                border-radius: 12px;
+                border: 1px solid rgba(255, 235, 59, 0.3);
+                text-align: center;
+                max-width: 90%;
+            }
+
             #controls { background: #202c33; padding: 15px; border-top: 1px solid #374045; }
             
             button { 
                 padding: 10px 20px; border-radius: 24px; border: none; font-size: 1rem; cursor: pointer; margin: 0 5px; font-weight: bold; transition: opacity 0.2s;
             }
             button:active { opacity: 0.7; }
-            
             #btn-start { background: #00a884; color: #fff; }
             #btn-stop { background: #ef5350; color: #fff; display: none; }
             #btn-register { background: #3b4a54; color: #fff; font-size: 0.8rem; padding: 8px 15px; }
-
             #status { margin-bottom: 10px; font-size: 0.9rem; color: #8696a0; min-height: 1.2em; }
         </style>
     </head>
     <body>
         <div id="container">
             <header>
-                <span>AI Agent</span>
+                <span>Team Chat AI</span>
                 <button id="btn-register">＋ メンバー追加</button>
             </header>
             
@@ -392,36 +403,60 @@ async def get_root():
             const statusDiv = document.getElementById('status');
             const chatBox = document.getElementById('chat-box');
 
-            // --- 再生管理用変数 ---
             let audioQueue = [];
             let isPlaying = false;
-            let currentSourceNode = null; // 現在再生中のAudioBufferSourceNode
-            let currentAiBubble = null;   // 字幕ストリーミング用DOM
+            let currentSourceNode = null;
+            let currentAiBubble = null;
 
-            // --- UI Helper ---
-            function logChat(role, text) {
+            // --- チャットログ表示 ---
+            function logChat(role, text, speakerId = null) {
                 const row = document.createElement('div');
                 row.className = `row ${role}`;
+                
+                if (role === 'user' && speakerId) {
+                    const nameLabel = document.createElement('div');
+                    nameLabel.className = 'speaker-name';
+                    nameLabel.textContent = speakerId; 
+                    row.appendChild(nameLabel);
+                    
+                    const idNum = speakerId.replace('User ', '');
+                    if (!isNaN(idNum)) {
+                        row.classList.add(`user-type-${idNum}`);
+                    } else {
+                        row.classList.add('user-type-unknown');
+                    }
+                } else if (role === 'ai') {
+                    const nameLabel = document.createElement('div');
+                    nameLabel.className = 'speaker-name';
+                    nameLabel.textContent = "AI Assistant";
+                    row.appendChild(nameLabel);
+                }
+
                 const bubble = document.createElement('div');
                 bubble.className = 'bubble';
+                
+                // システム警告の場合は特別なクラスを追加
+                if (role === 'system') {
+                    bubble.classList.add('system-alert');
+                }
+                
                 bubble.textContent = text;
                 row.appendChild(bubble);
+                
                 chatBox.appendChild(row);
                 chatBox.scrollTop = chatBox.scrollHeight;
-                return bubble; 
+                return bubble;
             }
 
-            // --- メンバー登録 ---
             btnRegister.onclick = async () => {
                 try {
                     await fetch('/enable-registration', { method: 'POST' });
                     statusDiv.textContent = "🆕 新規メンバー登録モード";
                     statusDiv.style.color = "#00a884";
-                    logChat('ai', "【システム】次に話す人の声を登録します。何か話しかけてください。");
+                    logChat('ai', "【システム】新しい方の声を登録します。マイクに向かって話しかけてください。");
                 } catch(e) { console.error(e); }
             };
 
-            // --- WebSocket & Audio ---
             async function startRecording() {
                 try {
                     statusDiv.textContent = "サーバー接続中...";
@@ -431,43 +466,40 @@ async def get_root():
 
                     socket.onopen = async () => {
                         console.log("WS Connected");
-                        statusDiv.textContent = "🎙️ 準備OK。話しかけてください";
+                        statusDiv.textContent = "🎙️ 準備OK";
                         statusDiv.style.color = "#e9edef";
-                        
                         btnStart.style.display = 'none';
                         btnStop.style.display = 'inline-block';
-                        
                         await initAudioStream();
                     };
 
                     socket.onmessage = async (event) => {
                         if (event.data instanceof ArrayBuffer) {
-                            // 音声データ受信 -> キューに追加して再生処理へ
                             audioQueue.push(event.data);
                             processAudioQueue();
                         } else {
                             const data = JSON.parse(event.data);
                             
-                            // ステータス更新
                             if (data.status === 'processing') {
                                 statusDiv.textContent = data.message;
-                                if (data.message.includes("聞いて")) statusDiv.style.color = "#ef5350"; 
-                                else if (data.message.includes("思考中")) statusDiv.style.color = "#00a884";
                             }
-                            
-                            // ★★★ 割り込み (Interrupt) 処理 ★★★
                             if (data.status === 'interrupt') {
-                                console.log("🛑 Interrupt Signal Received!");
-                                stopAudioPlayback(); // 音声を即時停止
-                                // 字幕(bubble)は維持する（ユーザーの希望）
+                                stopAudioPlayback();
+                            }
+                            if (data.status === 'system_info') {
+                                logChat('ai', data.message);
                             }
 
-                            // ユーザーの発言（即字幕表示）
+                            // ★ システム警告の表示 ★
+                            if (data.status === 'system_alert') {
+                                logChat('system', data.message);
+                                statusDiv.textContent = "待機中...";
+                            }
+
                             if (data.status === 'transcribed') {
-                                logChat('user', data.question_text);
+                                logChat('user', data.question_text, data.speaker_id);
                             }
 
-                            // AIの回答（字幕ストリーミング）
                             if (data.status === 'reply_chunk') {
                                 if (!currentAiBubble) {
                                     currentAiBubble = logChat('ai', ''); 
@@ -475,51 +507,30 @@ async def get_root():
                                 currentAiBubble.textContent += data.text_chunk;
                                 chatBox.scrollTop = chatBox.scrollHeight;
                             }
-
-                            // 完了時
                             if (data.status === 'complete') {
                                 if (!currentAiBubble && data.answer_text) {
                                     logChat('ai', data.answer_text);
                                 }
-                                currentAiBubble = null; 
-                                statusDiv.textContent = "🎙️ 準備OK。話しかけてください";
-                                statusDiv.style.color = "#e9edef";
-                            }
-
-                            if (data.status === 'ignored') {
-                                statusDiv.textContent = data.message;
+                                currentAiBubble = null;
+                                statusDiv.textContent = "🎙️ 準備OK";
                             }
                         }
                     };
-
                     socket.onclose = () => stopRecording();
-
                 } catch (e) {
                     console.error(e);
-                    statusDiv.textContent = "接続エラー";
                 }
             }
 
             async function initAudioStream() {
                 audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
-                const stream = await navigator.mediaDevices.getUserMedia({ 
-                    audio: { 
-                        channelCount: 1, 
-                        echoCancellation: true, 
-                        noiseSuppression: true,
-                        autoGainControl: true
-                    } 
-                });
-                
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
                 sourceInput = audioContext.createMediaStreamSource(stream);
                 processor = audioContext.createScriptProcessor(4096, 1, 1);
-                
                 processor.onaudioprocess = (e) => {
                     if (!socket || socket.readyState !== WebSocket.OPEN) return;
-                    const inputData = e.inputBuffer.getChannelData(0);
-                    socket.send(inputData.buffer);
+                    socket.send(e.inputBuffer.getChannelData(0).buffer);
                 };
-                
                 sourceInput.connect(processor);
                 processor.connect(audioContext.destination);
                 isRecording = true;
@@ -531,61 +542,31 @@ async def get_root():
                 if (processor) processor.disconnect();
                 if (audioContext) audioContext.close();
                 if (socket) socket.close();
-                
                 btnStart.style.display = 'inline-block';
                 btnStop.style.display = 'none';
                 statusDiv.textContent = "停止中";
             }
 
-            // --- 再生ロジック (割り込み対応版) ---
-            
-            // 音声を即時停止し、キューをクリアする関数
             function stopAudioPlayback() {
-                // 1. 再生中なら止める
-                if (currentSourceNode) {
-                    try {
-                        currentSourceNode.stop();
-                    } catch(e) {
-                        // すでに止まっている場合などは無視
-                    }
-                    currentSourceNode = null;
-                }
-                // 2. 待機中の音声を破棄
+                if (currentSourceNode) { try { currentSourceNode.stop(); } catch(e){} currentSourceNode = null; }
                 audioQueue = [];
                 isPlaying = false;
-                console.log("Audio Playback Cleared.");
             }
 
             async function processAudioQueue() {
                 if (isPlaying || audioQueue.length === 0) return;
                 isPlaying = true;
                 const wavData = audioQueue.shift();
-                
                 try {
-                    if (!audioContext || audioContext.state === 'closed') {
-                         audioContext = new (window.AudioContext || window.webkitAudioContext)();
-                    }
+                    if (!audioContext || audioContext.state === 'closed') audioContext = new (window.AudioContext || window.webkitAudioContext)();
                     const audioBuffer = await audioContext.decodeAudioData(wavData);
-                    
                     const source = audioContext.createBufferSource();
                     source.buffer = audioBuffer;
                     source.connect(audioContext.destination);
-                    
-                    // 現在のソースとして保持（stop用）
                     currentSourceNode = source;
-                    
-                    source.onended = () => {
-                        // 正常終了した場合のみ次へ（stopされた場合はここは呼ばれるが、queueは空になっているはず）
-                        currentSourceNode = null;
-                        isPlaying = false;
-                        processAudioQueue();
-                    };
+                    source.onended = () => { currentSourceNode = null; isPlaying = false; processAudioQueue(); };
                     source.start(0);
-                } catch(e) {
-                    console.error("再生エラー", e);
-                    isPlaying = false;
-                    currentSourceNode = null;
-                }
+                } catch(e) { isPlaying = false; currentSourceNode = null; }
             }
 
             btnStart.onclick = startRecording;

@@ -1,13 +1,10 @@
-# /workspace/answer_generator.py (マルチAPI対応版)
+# /workspace/supporter_generator.py (修正版)
 
-import google.generativeai as genai  # ★ 追加
+import google.generativeai as genai
 import os
-import time
-
 
 # Google (Gemini)
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-# Google APIキーを設定（キーがある場合のみ）
 if GOOGLE_API_KEY:
     try:
         genai.configure(api_key=GOOGLE_API_KEY)
@@ -15,71 +12,77 @@ if GOOGLE_API_KEY:
         print(f"[ERROR] Google genai の設定に失敗: {e}")
 
 
-# --- 2. モデル名に応じて処理を分岐する ---
+# --- システムプロンプト ---
+SYSTEM_PROMPT = """
+あなたはなんでも良く知っている知識人です。周りの人からさまざまな質問をされます。
+以下のルールに従い、ユーザーの音声を認識したテキストに応答してください。
 
-def generate_answer(question: str, model="gemini-2.5-flash-lite") -> str:
-    """
-    受け取った質問テキストに対し、指定されたモデルで回答を生成する。
-    model名のプレフィックスでAPIを自動的に切り替える。
-    
-    Args:
-        question (str): 文字起こしされた質問文
-        model (str): 使用するモデル名 
-                      ("gpt-...", "gemini-...", "claude-...")
-        
-    Returns:
-        str: 生成された回答文
-    """
-    print(f"[DEBUG] 回答生成中... (モデル: {model}) 質問: '{question}'")
-    
-    if not question:
-        return "質問を聞き取れませんでした。"
+### 【重要】文脈補完と入力解釈ルール
+ユーザーの音声入力は、滑舌が悪かったり、誤字脱字を含んでいる可能性が非常に高いです。
+入力された文字列をそのまま受け取るのではなく、**「なんでも良く知っている知識人として回答する」という文脈**に基づいて、脳内で正しい質問に自動変換してから回答してください。
 
-    answer = ""
-    system_prompt = "あなたは丁寧かつ簡潔に質問に答えるアシスタントです。あなたの回答は音声として読み上げられるので、マークダウンではなく、特殊な記号を含まない100文字以内の文章を出力してください。"
+**変換の例:**
+- 「スインってどこ？」 → 解釈：「スペインってどこ？」
+- 「なら時代はいつ？」 → 解釈：「奈良時代とは西暦でいうといつぐらいでしょうか？」
 
-    try:
-        
 
-        # --- B. Google (gemini-...) ---
-        if model.startswith("gemini-"):
-            if not GOOGLE_API_KEY:
-                raise ValueError("GOOGLE_API_KEY が設定されていません")
-            
-            # Geminiモデルを初期化
-            model_instance = genai.GenerativeModel(
-                model_name=model,
-                system_instruction=system_prompt
-            )
-            response = model_instance.generate_content(question)
-            answer = response.text.strip()
+---
 
-       
+### 【重要】マルチユーザー対応ルール
+入力は `【User ID】 発言内容` の形式で送られます（例: `【User 1】 保険料はいくら？`）。
 
-        # --- D. 対応モデルなし ---
-        else:
-            raise ValueError(f"対応していないモデル名です: {model}")
+1.  **話者の切り替わりを検知せよ**:
+    - 直前の会話相手とは別の `【User ID】` から発言があった場合、**即座にその新しい話者に意識を切り替えてください**。
+    - 前のユーザーとの話が途中であっても、新しいユーザーが「こんにちは」と挨拶したり、全く別の質問をした場合は、**新しいユーザーの話題を優先**してください。
 
-        print(f"[DEBUG] {model} 回答生成完了: '{answer[:30]}...'")
+2.  **個別対応と呼びかけ**:
+    - 「こんにちは」等の挨拶には、必ず挨拶で返してください。無視してはいけません。
+    - 各ユーザーの質問には、そのユーザーに向けた回答を行ってください。
 
-    except Exception as e:
-        print(f"[ERROR] {model} での回答生成に失敗しました: {e}")
-        answer = f"申し訳ありません、回答を生成中にエラーが発生しました。({e})"
+3.  **文脈の共有**:
+    - 全員が同じ場にいます。User 1への説明をUser 2も聞いています。
+    - したがって、User 1が質問した内容に対してUser 2が「それは〜」と続ける場合があります。この場合、User 2の発言はUser 1への回答として扱い、適切に補完してください。
+    - また、指示語（「それ」「あれ」など）が使われた場合も、直前の発言内容を参照して解釈してください。
 
-    return answer
+---
 
-def generate_answer_stream(question: str, model="gemini-2.5-flash-lite"):
+### 入力判定と応答ルール
+
+**1. 無視すべき入力（出力：[SILENCE]）**
+以下に該当する場合、補完は行わず、一切応答せず **[SILENCE]** とだけ出力してください。
+- **フィラー・言い淀み**: 「あー」「えーと」「んー」のみの場合。
+- **独り言・第三者との会話**: AIに向けられたものではない発言（「これ高いね」「飯行こう」など）。
+- **文脈不能なノイズ**: 全く意味をなさない文字列。
+
+**2. 応答すべき入力**
+- 保険に関する質問、相談、AIへの呼びかけ。
+- 多少言葉が崩れていても、意図が汲み取れる場合。
+
+---
+
+### 出力生成ガイドライン（応答する場合）
+1. **役割**: 保険のプロとして、親身かつ「です・ます」調で話す。
+2. **リード**: 「奈良時代の有名人について知りたいですか？それとも有名な出来事について知りたいですか？」のように選択肢を提示し、会話を前に進める。
+3. **形式**: Markdown、絵文字、URLは禁止。40〜80文字程度の短文推奨。
+"""
+
+# モデル名 (確実に動作するもの)
+DEFAULT_MODEL = "gemini-2.5-flash-lite"
+
+def generate_answer_stream(question: str, model=DEFAULT_MODEL, history: list = None):
     """
     回答をストリーミング(ジェネレータ)として返す
     """
-    print(f"[DEBUG] 回答ストリーミング生成開始... (モデル: {model})")
+    # 履歴がNoneなら空リストで初期化
+    if history is None:
+        history = []
+        
+    print(f"[DEBUG] ストリーミング生成開始... (モデル: {model}, 履歴数: {len(history)})")
     
     if not question:
         yield "質問を聞き取れませんでした。"
         return
 
-    system_prompt = "あなたは丁寧に質問に答えるアシスタントです。"
-
     try:
         if model.startswith("gemini-"):
             if not GOOGLE_API_KEY:
@@ -87,31 +90,43 @@ def generate_answer_stream(question: str, model="gemini-2.5-flash-lite"):
             
             model_instance = genai.GenerativeModel(
                 model_name=model,
-                system_instruction=system_prompt
+                system_instruction=SYSTEM_PROMPT,
+                generation_config={"temperature": 0.2}
             )
-            # ★ stream=False に設定
-            response = model_instance.generate_content(question, stream=False)
             
+            # 会話履歴を引き継ぐ
+            chat_session = model_instance.start_chat(history=history)
+            
+            # ストリーミングリクエスト
+            response = chat_session.send_message(question, stream=True)
+            
+            # ★★★ エラー対策の修正箇所 ★★★
             for chunk in response:
-                if chunk.text:
-                    yield chunk.text
+                try:
+                    # chunk.text にアクセスしてみて、中身があれば yield する
+                    text_part = chunk.text
+                    if text_part:
+                        yield text_part
+                except ValueError:
+                    # 「終了合図」などの空データが来た場合、ValueErrorが出るので無視して次へ
+                    continue
+
         else:
             yield f"対応していないモデル名です: {model}"
 
     except Exception as e:
         print(f"[ERROR] ストリーミング生成エラー: {e}")
         yield "申し訳ありません、エラーが発生しました。"
-# --- 3. 単体テスト (全モデルをテスト) ---
+
+
+# --- 単体テスト ---
 if __name__ == "__main__":
-    print("--- マルチAPI回答生成 単体テスト ---")
-    test_q = "こんにちは、今日の天気はどうですか？"
-
-
-    # --- Google/Gemini テスト ---
+    print("--- テスト実行 ---")
     if GOOGLE_API_KEY:
-        print("\n[Test] gemini-2.5-flash-lite")
-        ans_gemini = generate_answer(test_q, model="gemini-2.5-flash-lite")
-        print(f"Gemini 回答: {ans_gemini}")
+        # 空の履歴でテスト
+        iterator = generate_answer_stream("こんにちは", history=[])
+        for text in iterator:
+            print(text, end="", flush=True)
+        print("\n")
     else:
-        print("\n[Skipped] GOOGLE_API_KEY 未設定のため gemini-2.5-flash-lite をスキップ")
-    
+        print("APIキーがありません")

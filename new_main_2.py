@@ -28,7 +28,7 @@ try:
     from transcribe_func import GLOBAL_ASR_MODEL_INSTANCE
     from supporter_generator import generate_answer_stream, generate_quick_ack
     from new_text_to_speech import synthesize_speech
-    from new_speaker_filter import SpeakerGuard
+    from speaker_filter import SpeakerGuard
 except ImportError as e:
     logger.error(f"[ERROR] 必要なモジュールが見つかりません: {e}")
     sys.exit(1)

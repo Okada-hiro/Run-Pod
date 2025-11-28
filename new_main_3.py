@@ -209,7 +209,13 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     logger.info("[WS] Client Connected.")
     
-    vad_iterator = VADIterator(vad_model)
+    vad_iterator = VADIterator(
+    vad_model, 
+    threshold=0.5, 
+    sampling_rate=16000, 
+    min_silence_duration_ms=500, 
+    speech_pad_ms=50
+)
     audio_buffer = [] 
     is_speaking = False
     interruption_triggered = False # 今回の発話ですでに割り込み指示を出したか

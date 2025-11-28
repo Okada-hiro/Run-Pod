@@ -1,5 +1,5 @@
 # /workspace/new_main_2.py
-# 二つのモデルを使う
+# Server-Side VAD + Streaming + Speaker ID + Toast + Hybrid LLM (Lite Ack + Main Answer)
 
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 # --- 必要なモジュールのインポート ---
 try:
     from transcribe_func import GLOBAL_ASR_MODEL_INSTANCE
+    # generate_quick_ack を追加インポート
     from supporter_generator import generate_answer_stream, generate_quick_ack
     from new_text_to_speech import synthesize_speech
     from speaker_filter import SpeakerGuard
@@ -73,7 +74,7 @@ async def enable_registration():
     return {"message": "登録モード待機中"}
 
 
-# --- ヘルパー: 音声処理パイプライン (字幕ON版) ---
+# --- ヘルパー: 音声処理パイプライン (ハイブリッド構成) ---
 async def process_voice_pipeline(audio_float32_np, websocket: WebSocket, chat_history: list):
     global NEXT_AUDIO_IS_REGISTRATION
     
@@ -132,21 +133,17 @@ async def process_voice_pipeline(audio_float32_np, websocket: WebSocket, chat_hi
         text_with_context = f"【{speaker_id}】 {text}"
         logger.info(f"[TASK] {text_with_context}")
         
-        # --- ★★★ Phase A: 相槌 (Lite) ★★★ ---
+        # --- ★★★ Phase A: 相槌 (Lite) - 速攻で生成して返す ★★★ ---
+        # 非同期でやってもいいが、TTSの順番が大事なので、ここはあえてawaitして
+        # 「相槌の音声」を確定させてからメインを流すのが安全かつ自然。
+        # Liteは非常に速いのでここでの待ちは許容範囲。
         logger.info("🚀 [Lite] Generating Aizuchi...")
         ack_text = await asyncio.to_thread(generate_quick_ack, text)
         
         if ack_text:
             logger.info(f"🚀 [Lite] Aizuchi: {ack_text}")
-            
-            # ★ ここで字幕（テキスト）を送信！
-            # メイン回答と同じ吹き出しに追加されるよう "reply_chunk" を使用します。
-            # 読みやすくするために末尾に改行かスペースを入れると良いです。
-            await websocket.send_json({
-                "status": "reply_chunk", 
-                "text_chunk": ack_text + "\n" 
-            })
-
+            # 字幕には出さない（メイン回答と重複感が出るため）か、出すなら薄く出す。
+            # 今回は音声のみ先行再生させる。
             ack_wav_path = os.path.join(PROCESSING_DIR, "ack_temp.wav")
             ack_success = await asyncio.to_thread(synthesize_speech, ack_text, ack_wav_path)
             
@@ -155,13 +152,14 @@ async def process_voice_pipeline(audio_float32_np, websocket: WebSocket, chat_hi
                     ack_bytes = f.read()
                 await websocket.send_bytes(ack_bytes)
         
-        # --- ★★★ Phase B: 本回答 (Main) ★★★ ---
+        # --- ★★★ Phase B: 本回答 (Main) - ユーザーへ ---
         await websocket.send_json({
             "status": "transcribed",
             "question_text": text,
             "speaker_id": speaker_id 
         })
 
+        # 相槌が終わった直後くらいにメインの音声が届くはず
         await handle_llm_tts(text_with_context, websocket, chat_history)
 
     except Exception as e:
@@ -195,6 +193,7 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
             text_buffer += chunk
             full_answer += chunk
             
+            # Liteが相槌しているので、Mainが[SILENCE]を出すケースは少ないが念のため
             if full_answer.strip() == "[SILENCE]":
                 await websocket.send_json({
                     "status": "system_alert", 
@@ -248,7 +247,7 @@ async def websocket_endpoint(websocket: WebSocket):
     
     WINDOW_SIZE_SAMPLES = 512 
     SAMPLE_RATE = 16000
-    CHECK_SPEAKER_SAMPLES = 30000 
+    CHECK_SPEAKER_SAMPLES = 24000 # 1.5秒 (短い相槌対策)
     
     chat_history = []
 
@@ -317,6 +316,7 @@ async def websocket_endpoint(websocket: WebSocket):
 # ---------------------------
 @app.get("/", response_class=HTMLResponse)
 async def get_root():
+    # 前回と同じHTMLを返します
     return """
     <!DOCTYPE html>
     <html lang="ja">

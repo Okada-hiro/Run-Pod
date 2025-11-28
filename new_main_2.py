@@ -110,7 +110,7 @@ async def process_voice_pipeline(audio_float32_np, websocket: WebSocket, chat_hi
         
         # 1.0秒未満で認証失敗した場合は、ノイズや短い相槌の可能性が高いため、
         # 警告を出さずに「無視」する。
-        if duration_sec < 1.0:
+        if duration_sec < 2.5:
             logger.info(f"[Ignored] Short audio ({duration_sec:.2f}s) failed auth. Treating as noise.")
             await websocket.send_json({"status": "ignored", "message": "..."})
             return

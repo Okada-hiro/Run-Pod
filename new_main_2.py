@@ -104,6 +104,17 @@ async def process_voice_pipeline(audio_float32_np, websocket: WebSocket, chat_hi
 
     # 2. アクセス制御
     if not is_allowed:
+        # ★★★ ここを修正: 短い音声の誤検知対策 ★★★
+        # 音声の長さを秒単位で計算 (サンプル数 / サンプリングレート)
+        duration_sec = len(audio_float32_np) / 16000
+        
+        # 1.0秒未満で認証失敗した場合は、ノイズや短い相槌の可能性が高いため、
+        # 警告を出さずに「無視」する。
+        if duration_sec < 1.0:
+            logger.info(f"[Ignored] Short audio ({duration_sec:.2f}s) failed auth. Treating as noise.")
+            await websocket.send_json({"status": "ignored", "message": "..."})
+            return
+
         logger.info("[Access Denied] 登録されていない話者です。")
         await websocket.send_json({
             "status": "system_alert", 
@@ -250,7 +261,7 @@ async def websocket_endpoint(websocket: WebSocket):
     
     WINDOW_SIZE_SAMPLES = 512 
     SAMPLE_RATE = 16000
-    CHECK_SPEAKER_SAMPLES = 24000 
+    CHECK_SPEAKER_SAMPLES = 28000 
     
     chat_history = []
 

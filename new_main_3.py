@@ -1,5 +1,5 @@
 # /workspace/new_main_2.py
-# Server-Side VAD + Streaming + Speaker ID + System Alerts (Yellow Warnings)
+# Server-Side VAD + Streaming + Speaker ID + Toast Notifications + Improved UI
 
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -27,7 +27,7 @@ try:
     from transcribe_func import GLOBAL_ASR_MODEL_INSTANCE
     from supporter_generator import generate_answer_stream
     from new_text_to_speech import synthesize_speech
-    from speaker_filter import SpeakerGuard
+    from new_speaker_filter import SpeakerGuard
 except ImportError as e:
     logger.error(f"[ERROR] 必要なモジュールが見つかりません: {e}")
     sys.exit(1)
@@ -109,11 +109,11 @@ async def process_voice_pipeline(audio_float32_np, websocket: WebSocket, chat_hi
     # ---------------------------
     if not is_allowed:
         logger.info("[Access Denied] 登録されていない話者です。")
-        # ★ ここを変更: system_alert を送信
+        # ★ "unregistered" タイプとして送信
         await websocket.send_json({
             "status": "system_alert", 
-            "message": "⚠️ 外部の会話(未登録)を検知しました。会話を続けてください。",
-            "alert_type": "warning"
+            "message": "⚠️ 外部の会話(未登録)を検知しました。ユーザーとして追加する場合は「メンバー追加」から行ってください。",
+            "alert_type": "unregistered" 
         })
         return
 
@@ -181,12 +181,12 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
             text_buffer += chunk
             full_answer += chunk
             
-            # ★ ここを変更: [SILENCE] の場合の処理
+            # ★ "irrelevant" タイプとして送信
             if full_answer.strip() == "[SILENCE]":
                 await websocket.send_json({
                     "status": "system_alert", 
-                    "message": "⚠️ 会話外の音声と判断しました。続けてください。",
-                    "alert_type": "warning"
+                    "message": "⚠️ 会話外の音声と判断しました。会話を続けてください。",
+                    "alert_type": "irrelevant"
                 })
                 return
 
@@ -269,8 +269,6 @@ async def websocket_endpoint(websocket: WebSocket):
                             
                             if len(full_audio) / SAMPLE_RATE < 0.2:
                                 logger.info("Noise detected")
-                                # 短すぎる音も黄色警告にするか、あるいは無視するか。
-                                # ここでは無視（statusバーのみ更新）にしておきます（頻発するとウザいため）
                                 await websocket.send_json({"status": "ignored", "message": "..."})
                             else:
                                 await websocket.send_json({"status": "processing", "message": "🧠 AI思考中..."})
@@ -301,7 +299,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
 
 # ---------------------------
-# フロントエンド (システム警告UI対応)
+# フロントエンド (Toast通知 & UI改善)
 # ---------------------------
 @app.get("/", response_class=HTMLResponse)
 async def get_root():
@@ -314,12 +312,12 @@ async def get_root():
         <title>Team Chat AI</title>
         <style>
             body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; display: grid; place-items: center; min-height: 90vh; background: #202c33; color: #e9edef; margin: 0; }
-            #container { background: #111b21; padding: 0; border-radius: 0; text-align: center; width: 100%; max-width: 600px; height: 100vh; display: flex; flex-direction: column; box-shadow: 0 0 20px rgba(0,0,0,0.5); }
+            #container { background: #111b21; padding: 0; border-radius: 0; text-align: center; width: 100%; max-width: 600px; height: 100vh; display: flex; flex-direction: column; box-shadow: 0 0 20px rgba(0,0,0,0.5); position: relative; overflow: hidden; }
             @media (min-width: 600px) {
                 #container { height: 90vh; border-radius: 12px; }
             }
             
-            header { background: #202c33; padding: 15px; border-bottom: 1px solid #374045; font-weight: bold; font-size: 1.1rem; display: flex; justify-content: space-between; align-items: center; }
+            header { background: #202c33; padding: 15px; border-bottom: 1px solid #374045; font-weight: bold; font-size: 1.1rem; display: flex; justify-content: space-between; align-items: center; z-index: 10; }
             
             #chat-box { 
                 flex: 1; overflow-y: auto; padding: 20px; 
@@ -327,6 +325,7 @@ async def get_root():
                 background-repeat: repeat;
                 background-size: 400px;
                 background-color: #0b141a;
+                position: relative;
             }
 
             .row { display: flex; width: 100%; margin-bottom: 8px; flex-direction: column; }
@@ -350,17 +349,62 @@ async def get_root():
             .user-type-2 .bubble { background: #6b63ff; color: #fff; border-top-right-radius: 0; }
             .user-type-unknown .bubble { background: #374045; color: #e9edef; border-top-right-radius: 0; }
             
-            /* ★システム警告用スタイル★ */
-            .system-alert {
-                background: rgba(255, 241, 118, 0.1); /* 背景うっすら黄色 */
-                color: #ffeb3b;                       /* 文字は明るい黄色 */
-                font-size: 0.8rem;
-                padding: 4px 12px;
-                border-radius: 12px;
-                border: 1px solid rgba(255, 235, 59, 0.3);
+            /* ★システム警告(無関係な内容)用スタイル - 視認性改善★ */
+            .system-bubble {
+                background: #4a3b00;         /* 暗めのオレンジ背景 */
+                color: #ffecb3;              /* 明るいクリーム色の文字 */
+                font-size: 0.85rem;
+                padding: 6px 16px;
+                border-radius: 16px;
+                border: 1px solid #ffb300;   /* 明るいオレンジの枠線 */
                 text-align: center;
                 max-width: 90%;
+                font-weight: 500;
+                box-shadow: 0 2px 5px rgba(0,0,0,0.3);
             }
+
+            /* ★未登録の声用 Toast通知スタイル★ */
+            #toast-container {
+                position: absolute;
+                top: 70px; /* ヘッダーの下 */
+                left: 50%;
+                transform: translateX(-50%);
+                z-index: 100;
+                width: 90%;
+                max-width: 400px;
+                pointer-events: none; /* クリックを透過(ボタン以外) */
+            }
+            .toast {
+                background: rgba(30, 30, 30, 0.95);
+                color: #fff;
+                padding: 12px 16px;
+                border-radius: 8px;
+                box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+                border-left: 4px solid #f44336; /* 赤いアクセント */
+                margin-bottom: 10px;
+                font-size: 0.9rem;
+                display: flex;
+                flex-direction: column;
+                gap: 8px;
+                opacity: 0;
+                animation: slideDown 0.3s forwards, fadeOut 0.5s forwards 2.5s; /* 2.5秒後に消える */
+                pointer-events: auto;
+            }
+            
+            @keyframes slideDown { from { transform: translateY(-20px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+            @keyframes fadeOut { from { opacity: 1; } to { opacity: 0; visibility: hidden; } }
+
+            .toast-btn {
+                align-self: flex-end;
+                background: transparent;
+                border: 1px solid #666;
+                color: #ccc;
+                font-size: 0.75rem;
+                padding: 4px 8px;
+                border-radius: 4px;
+                cursor: pointer;
+            }
+            .toast-btn:hover { background: #333; color: #fff; }
 
             #controls { background: #202c33; padding: 15px; border-top: 1px solid #374045; }
             
@@ -381,7 +425,7 @@ async def get_root():
                 <button id="btn-register">＋ メンバー追加</button>
             </header>
             
-            <div id="chat-box"></div>
+            <div id="toast-container"></div> <div id="chat-box"></div>
             
             <div id="controls">
                 <div id="status">接続待機中...</div>
@@ -402,47 +446,81 @@ async def get_root():
             const btnRegister = document.getElementById('btn-register');
             const statusDiv = document.getElementById('status');
             const chatBox = document.getElementById('chat-box');
+            const toastContainer = document.getElementById('toast-container');
 
             let audioQueue = [];
             let isPlaying = false;
             let currentSourceNode = null;
             let currentAiBubble = null;
+            
+            // ★「今後表示しない」設定
+            let muteUnregisteredWarning = false;
+
+            // --- Toast通知機能 ---
+            function showToast(message) {
+                if (muteUnregisteredWarning) return;
+
+                const toast = document.createElement('div');
+                toast.className = 'toast';
+                
+                const msgText = document.createElement('span');
+                msgText.textContent = message;
+                
+                const muteBtn = document.createElement('button');
+                muteBtn.className = 'toast-btn';
+                muteBtn.textContent = "今後このメッセージを表示しない";
+                muteBtn.onclick = () => {
+                    muteUnregisteredWarning = true;
+                    toast.style.display = 'none'; // 即座に消す
+                };
+
+                toast.appendChild(msgText);
+                toast.appendChild(muteBtn);
+                toastContainer.appendChild(toast);
+
+                // アニメーション終了後にDOMから削除 (3s)
+                setTimeout(() => {
+                    if (toast.parentNode) toast.parentNode.removeChild(toast);
+                }, 3000);
+            }
 
             // --- チャットログ表示 ---
             function logChat(role, text, speakerId = null) {
                 const row = document.createElement('div');
                 row.className = `row ${role}`;
                 
-                if (role === 'user' && speakerId) {
-                    const nameLabel = document.createElement('div');
-                    nameLabel.className = 'speaker-name';
-                    nameLabel.textContent = speakerId; 
-                    row.appendChild(nameLabel);
-                    
-                    const idNum = speakerId.replace('User ', '');
-                    if (!isNaN(idNum)) {
-                        row.classList.add(`user-type-${idNum}`);
-                    } else {
-                        row.classList.add('user-type-unknown');
-                    }
-                } else if (role === 'ai') {
-                    const nameLabel = document.createElement('div');
-                    nameLabel.className = 'speaker-name';
-                    nameLabel.textContent = "AI Assistant";
-                    row.appendChild(nameLabel);
-                }
-
                 const bubble = document.createElement('div');
-                bubble.className = 'bubble';
-                
-                // システム警告の場合は特別なクラスを追加
+
                 if (role === 'system') {
-                    bubble.classList.add('system-alert');
+                    // システム(無関係)の場合は専用スタイル
+                    bubble.className = 'system-bubble';
+                    bubble.textContent = text;
+                } else {
+                    // 通常メッセージ
+                    bubble.className = 'bubble';
+                    bubble.textContent = text;
+                    
+                    if (role === 'user' && speakerId) {
+                        const nameLabel = document.createElement('div');
+                        nameLabel.className = 'speaker-name';
+                        nameLabel.textContent = speakerId; 
+                        row.insertBefore(nameLabel, row.firstChild); // 名前後入れ調整
+                        
+                        const idNum = speakerId.replace('User ', '');
+                        if (!isNaN(idNum)) {
+                            row.classList.add(`user-type-${idNum}`);
+                        } else {
+                            row.classList.add('user-type-unknown');
+                        }
+                    } else if (role === 'ai') {
+                         const nameLabel = document.createElement('div');
+                        nameLabel.className = 'speaker-name';
+                        nameLabel.textContent = "AI Assistant";
+                        row.insertBefore(nameLabel, row.firstChild);
+                    }
                 }
                 
-                bubble.textContent = text;
                 row.appendChild(bubble);
-                
                 chatBox.appendChild(row);
                 chatBox.scrollTop = chatBox.scrollHeight;
                 return bubble;
@@ -490,9 +568,15 @@ async def get_root():
                                 logChat('ai', data.message);
                             }
 
-                            // ★ システム警告の表示 ★
+                            // ★ アラート分岐処理 ★
                             if (data.status === 'system_alert') {
-                                logChat('system', data.message);
+                                if (data.alert_type === 'unregistered') {
+                                    // 未登録 -> Toast表示
+                                    showToast(data.message);
+                                } else if (data.alert_type === 'irrelevant') {
+                                    // 無関係 -> ログ表示(色調整済み)
+                                    logChat('system', data.message);
+                                }
                                 statusDiv.textContent = "待機中...";
                             }
 

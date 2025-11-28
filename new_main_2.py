@@ -1,5 +1,5 @@
 # /workspace/new_main_2.py
-# Server-Side VAD + Streaming + Speaker ID + Toast + Filler (即時相槌)
+# Server-Side VAD + Streaming + Speaker ID + Toast + Hybrid LLM (Lite Ack + Main Answer)
 
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -26,18 +26,17 @@ logger = logging.getLogger(__name__)
 # --- 必要なモジュールのインポート ---
 try:
     from transcribe_func import GLOBAL_ASR_MODEL_INSTANCE
-    from supporter_generator import generate_answer_stream
+    # generate_quick_ack を追加インポート
+    from supporter_generator import generate_answer_stream, generate_quick_ack
     from new_text_to_speech import synthesize_speech
-    from speaker_filter import SpeakerGuard
+    from new_speaker_filter import SpeakerGuard
 except ImportError as e:
     logger.error(f"[ERROR] 必要なモジュールが見つかりません: {e}")
     sys.exit(1)
 
 # --- グローバル設定 ---
 PROCESSING_DIR = "incoming_audio"
-FILLER_DIR = "assets_filler" # 相槌用フォルダ
 os.makedirs(PROCESSING_DIR, exist_ok=True)
-os.makedirs(FILLER_DIR, exist_ok=True)
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 logger.info(f"Using Device: {DEVICE}")
@@ -48,37 +47,6 @@ app.mount(f"/download", StaticFiles(directory=PROCESSING_DIR), name="download")
 # SpeakerGuard初期化
 speaker_guard = SpeakerGuard()
 NEXT_AUDIO_IS_REGISTRATION = False
-
-# --- ★★★ フィラー（相槌）音声の事前生成 ★★★ ---
-FILLERS = {
-    "filler_short_1": "はい、",
-    "filler_short_2": "はい、",
-    "filler_short_3": "そうですね、",
-    "filler_ack_1": "承知いたしました。",
-    "filler_ack_2": "確認いたします。",
-}
-
-def pregenerate_fillers():
-    logger.info("⏳ Generating filler audios...")
-    for name, text in FILLERS.items():
-        path = os.path.join(FILLER_DIR, f"{name}.wav")
-        if not os.path.exists(path):
-            try:
-                # TTSを使って生成
-                synthesize_speech(text, path)
-                logger.info(f"✅ Generated filler: {name} ({text})")
-            except Exception as e:
-                logger.error(f"Failed to generate filler {name}: {e}")
-    logger.info("✅ Filler generation complete.")
-
-# 起動時に実行（非同期イベントループ外で実行するためここで呼ぶ）
-# ※ GLOBAL_TTS_MODELがロード済みであることを前提とするため、
-#   new_text_to_speech.py のインポート時にロードが走る構成ならこれでOK
-try:
-    pregenerate_fillers()
-except Exception as e:
-    logger.warning(f"Filler generation skipped: {e}")
-
 
 # --- Silero VAD のロード ---
 logger.info("⏳ Loading Silero VAD model...")
@@ -106,19 +74,16 @@ async def enable_registration():
     return {"message": "登録モード待機中"}
 
 
-# --- ヘルパー: 音声処理パイプライン ---
+# --- ヘルパー: 音声処理パイプライン (ハイブリッド構成) ---
 async def process_voice_pipeline(audio_float32_np, websocket: WebSocket, chat_history: list):
     global NEXT_AUDIO_IS_REGISTRATION
     
-    # SpeakerGuard用に Tensor化
     voice_tensor = torch.from_numpy(audio_float32_np).float().unsqueeze(0)
     
     speaker_id = "Unknown"
     is_allowed = False
 
-    # ---------------------------
-    # 1. 話者判定 / 登録ロジック
-    # ---------------------------
+    # 1. 話者判定 / 登録
     if NEXT_AUDIO_IS_REGISTRATION:
         temp_reg_path = f"{PROCESSING_DIR}/reg_{id(audio_float32_np)}.wav"
         import soundfile as sf
@@ -134,14 +99,11 @@ async def process_voice_pipeline(audio_float32_np, websocket: WebSocket, chat_hi
         else:
             await websocket.send_json({"status": "error", "message": "登録に失敗しました"})
             return
-            
     else:
         is_allowed, detected_id = await asyncio.to_thread(speaker_guard.identify_speaker, voice_tensor)
         speaker_id = detected_id
 
-    # ---------------------------
     # 2. アクセス制御
-    # ---------------------------
     if not is_allowed:
         logger.info("[Access Denied] 登録されていない話者です。")
         await websocket.send_json({
@@ -151,9 +113,7 @@ async def process_voice_pipeline(audio_float32_np, websocket: WebSocket, chat_hi
         })
         return
 
-    # ---------------------------
     # 3. Whisper 文字起こし
-    # ---------------------------
     try:
         if GLOBAL_ASR_MODEL_INSTANCE is None:
             raise ValueError("Whisper Model not loaded")
@@ -173,36 +133,33 @@ async def process_voice_pipeline(audio_float32_np, websocket: WebSocket, chat_hi
         text_with_context = f"【{speaker_id}】 {text}"
         logger.info(f"[TASK] {text_with_context}")
         
-        # --- ★★★ ここで「相槌」を即時再生！ ★★★ ---
-        # Geminiへの問い合わせ中に「間」を持たせる
-        # テキストの長さや文脈で変えても良いが、まずはランダムで
-        filler_keys = list(FILLERS.keys())
-        # 少しだけランダム性を制御（短い質問には短い相槌、など本当はした方がいい）
-        selected_key = random.choice(filler_keys)
-        filler_path = os.path.join(FILLER_DIR, f"{selected_key}.wav")
-
-        if os.path.exists(filler_path):
-            logger.info(f"⚡ [Filler] Playing filler: {selected_key}")
-            # 字幕も出す？ -> 出すと「はい、」と出た後にAIがまた喋りだすので、
-            # 字幕は出さずに音声だけ送るのが自然（あるいは (...) などを出す）
-            # await websocket.send_json({"status": "reply_chunk", "text_chunk": "..."}) 
+        # --- ★★★ Phase A: 相槌 (Lite) - 速攻で生成して返す ★★★ ---
+        # 非同期でやってもいいが、TTSの順番が大事なので、ここはあえてawaitして
+        # 「相槌の音声」を確定させてからメインを流すのが安全かつ自然。
+        # Liteは非常に速いのでここでの待ちは許容範囲。
+        logger.info("🚀 [Lite] Generating Aizuchi...")
+        ack_text = await asyncio.to_thread(generate_quick_ack, text)
+        
+        if ack_text:
+            logger.info(f"🚀 [Lite] Aizuchi: {ack_text}")
+            # 字幕には出さない（メイン回答と重複感が出るため）か、出すなら薄く出す。
+            # 今回は音声のみ先行再生させる。
+            ack_wav_path = os.path.join(PROCESSING_DIR, "ack_temp.wav")
+            ack_success = await asyncio.to_thread(synthesize_speech, ack_text, ack_wav_path)
             
-            with open(filler_path, 'rb') as f:
-                filler_bytes = f.read()
-            
-            # 音声を送信
-            await websocket.send_bytes(filler_bytes)
-        # ---------------------------------------------
-
+            if ack_success:
+                with open(ack_wav_path, 'rb') as f:
+                    ack_bytes = f.read()
+                await websocket.send_bytes(ack_bytes)
+        
+        # --- ★★★ Phase B: 本回答 (Main) - ユーザーへ ---
         await websocket.send_json({
             "status": "transcribed",
             "question_text": text,
             "speaker_id": speaker_id 
         })
 
-        # ---------------------------
-        # 4. LLM & TTS ストリーミング
-        # ---------------------------
+        # 相槌が終わった直後くらいにメインの音声が届くはず
         await handle_llm_tts(text_with_context, websocket, chat_history)
 
     except Exception as e:
@@ -236,6 +193,7 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
             text_buffer += chunk
             full_answer += chunk
             
+            # Liteが相槌しているので、Mainが[SILENCE]を出すケースは少ないが念のため
             if full_answer.strip() == "[SILENCE]":
                 await websocket.send_json({
                     "status": "system_alert", 
@@ -268,7 +226,7 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
 
 
 # ---------------------------
-# WebSocket エンドポイント (変更なし)
+# WebSocket エンドポイント
 # ---------------------------
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -289,7 +247,7 @@ async def websocket_endpoint(websocket: WebSocket):
     
     WINDOW_SIZE_SAMPLES = 512 
     SAMPLE_RATE = 16000
-    CHECK_SPEAKER_SAMPLES = 12000
+    CHECK_SPEAKER_SAMPLES = 24000 # 1.5秒 (短い相槌対策)
     
     chat_history = []
 
@@ -333,6 +291,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         audio_buffer.append(window_np)
                         
                         current_len = sum(len(c) for c in audio_buffer)
+                        
                         if not interruption_triggered and not NEXT_AUDIO_IS_REGISTRATION and current_len > CHECK_SPEAKER_SAMPLES:
                             temp_audio = np.concatenate(audio_buffer)
                             temp_tensor = torch.from_numpy(temp_audio).float().unsqueeze(0)
@@ -340,7 +299,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             is_verified, spk_id = await asyncio.to_thread(speaker_guard.identify_speaker, temp_tensor)
                             
                             if is_verified:
-                                logger.info(f"⚡ [Barge-in] {spk_id} の声を検知！停止指示。")
+                                logger.info(f"⚡ [Barge-in] {spk_id} の声を検知(1.5s以上)！停止指示。")
                                 await websocket.send_json({"status": "interrupt", "message": "🛑 音声停止"})
                                 interruption_triggered = True
 
@@ -357,9 +316,7 @@ async def websocket_endpoint(websocket: WebSocket):
 # ---------------------------
 @app.get("/", response_class=HTMLResponse)
 async def get_root():
-    # 前回作成したフロントエンドコードと同じなので、
-    # そのまま利用するか、前回のコードブロックをここに貼り付けてください。
-    # ここでは長くなるため省略せず、前回のコードと全く同じものを返すと想定してください。
+    # 前回と同じHTMLを返します
     return """
     <!DOCTYPE html>
     <html lang="ja">

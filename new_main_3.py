@@ -234,7 +234,7 @@ async def websocket_endpoint(websocket: WebSocket):
     
     WINDOW_SIZE_SAMPLES = 512 
     SAMPLE_RATE = 16000
-    CHECK_SPEAKER_SAMPLES = 12000
+    CHECK_SPEAKER_SAMPLES = 30000
     
     chat_history = []
 

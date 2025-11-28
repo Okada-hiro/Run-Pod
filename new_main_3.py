@@ -1,5 +1,4 @@
-# /workspace/new_main_2.py
-# Server-Side VAD + Streaming + Speaker ID + Toast Notifications + Improved UI
+#今はこれ! 11/28 15:18
 
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect

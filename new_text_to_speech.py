@@ -2,6 +2,7 @@
 import torch
 from pathlib import Path
 from scipy.io.wavfile import write
+import scipy.signal
 import os
 import numpy as np
 import sys

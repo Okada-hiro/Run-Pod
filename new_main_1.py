@@ -649,7 +649,7 @@ async def get_root():
                 audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
                 const stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
                 sourceInput = audioContext.createMediaStreamSource(stream);
-                processor = audioContext.createScriptProcessor(4096, 1, 1);
+                processor = audioContext.createScriptProcessor(512, 1, 1);
                 processor.onaudioprocess = (e) => {
                     if (!socket || socket.readyState !== WebSocket.OPEN) return;
                     socket.send(e.inputBuffer.getChannelData(0).buffer);

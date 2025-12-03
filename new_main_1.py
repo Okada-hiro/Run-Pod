@@ -184,14 +184,34 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
     iterator = generate_answer_stream(text_for_llm, history=chat_history)
 
     async def send_audio_chunk(phrase, idx):
-        # ファイル保存をスキップし、直接バイトデータをもらう
-        wav_bytes = await asyncio.to_thread(synthesize_speech_to_memory, phrase)
+        # 1. 音声をメモリ上で作成 (synthesize_speech_to_memory は Raw PCM を返す)
+        full_wav_bytes = await asyncio.to_thread(synthesize_speech_to_memory, phrase)
         
-        if wav_bytes:
+        if full_wav_bytes:
             try:
-                # そのまま即座に投げる
-                await websocket.send_bytes(wav_bytes)
-                logger.info(f"🚀 Sent audio chunk {idx} (size: {len(wav_bytes)} bytes)")
+                # --- ★限界チューニング: 0.1秒刻みで送信 ---
+                
+                # 計算式: 16000Hz * 16bit(2byte) * 0.1秒 = 3200 bytes
+                CHUNK_SIZE = 3200 
+                
+                total_len = len(full_wav_bytes)
+                offset = 0
+                
+                while offset < total_len:
+                    # 0.1秒分だけ切り出す
+                    chunk = full_wav_bytes[offset : offset + CHUNK_SIZE]
+                    
+                    # 送信！
+                    await websocket.send_bytes(chunk)
+                    
+                    offset += CHUNK_SIZE
+                    
+                    # 0秒待機を入れることで、他の処理(VADなど)にCPUを譲りつつ
+                    # ネットワークバッファが溢れるのを防ぎます
+                    await asyncio.sleep(0)
+                    
+                logger.info(f"🚀 Streamed audio {idx} (Total: {total_len} bytes)")
+                
             except RuntimeError:
                 pass
 

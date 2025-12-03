@@ -242,9 +242,9 @@ async def websocket_endpoint(websocket: WebSocket):
     
     vad_iterator = VADIterator(
         vad_model, 
-        threshold=0.8, 
+        threshold=0.95, 
         sampling_rate=16000, 
-        min_silence_duration_ms=600, 
+        min_silence_duration_ms=200, 
         speech_pad_ms=50
     )
 

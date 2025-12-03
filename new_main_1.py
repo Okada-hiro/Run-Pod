@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 try:
     from transcribe_func import GLOBAL_ASR_MODEL_INSTANCE
     from new_answer_generator import generate_answer_stream
-    from new_text_to_speech import synthesize_speech
+    from new_text_to_speech import synthesize_speech, synthesize_speech_to_memory
     from speaker_filter import SpeakerGuard
 except ImportError as e:
     logger.error(f"[ERROR] 必要なモジュールが見つかりません: {e}")
@@ -184,14 +184,14 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
     iterator = generate_answer_stream(text_for_llm, history=chat_history)
 
     async def send_audio_chunk(phrase, idx):
-        filename = f"resp_{idx}.wav"
-        path = os.path.join(PROCESSING_DIR, filename)
-        success = await asyncio.to_thread(synthesize_speech, phrase, path)
-        if success:
-            with open(path, 'rb') as f:
-                wav_data = f.read()
+        # ファイル保存をスキップし、直接バイトデータをもらう
+        wav_bytes = await asyncio.to_thread(synthesize_speech_to_memory, phrase)
+        
+        if wav_bytes:
             try:
-                await websocket.send_bytes(wav_data)
+                # そのまま即座に投げる
+                await websocket.send_bytes(wav_bytes)
+                logger.info(f"🚀 Sent audio chunk {idx} (size: {len(wav_bytes)} bytes)")
             except RuntimeError:
                 pass
 

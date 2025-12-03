@@ -164,6 +164,62 @@ def synthesize_speech(text_to_speak: str, output_wav_path: str, prompt_text: str
         traceback.print_exc()
         return False
 
+import io
+from scipy.io.wavfile import write as scipy_write
+
+def synthesize_speech_to_memory(text_to_speak: str) -> bytes:
+    """
+    音声をファイルに保存せず、バイトデータとして直接返す（高速化版）
+    """
+    if GLOBAL_TTS_MODEL is None or GLOBAL_SPEAKER_ID is None:
+        return None
+        
+    try:
+        # 1. 推論実行
+        sr, audio_data = GLOBAL_TTS_MODEL.infer(
+            text=text_to_speak,
+            language=Languages.JP,
+            speaker_id=GLOBAL_SPEAKER_ID,
+            style="Neutral",
+            style_weight=0.7,
+            sdp_ratio=0.2,
+            noise=0.6,
+            noise_w=0.8,
+            length=1.0
+        )
+        
+        # 2. 16bit PCMに変換
+        if audio_data.dtype != np.int16:
+            audio_norm = audio_data / np.abs(audio_data).max()
+            audio_int16 = (audio_norm * 32767).astype(np.int16)
+        else:
+            audio_int16 = audio_data
+
+        # --- ★高速化ポイント: ダウンサンプリング (データ量を減らす) ---
+        # Style-Bert-VITS2は通常44.1kHzでデータが重いため、24kHzに落とす
+        # (チャットボットなら24kHzで十分高音質です)
+        import librosa
+        target_sr = 24000
+        if sr > target_sr:
+            # float32に戻してリサンプリング
+            audio_float = audio_int16.astype(np.float32) / 32768.0
+            audio_resampled = librosa.resample(audio_float, orig_sr=sr, target_sr=target_sr)
+            # 再びint16へ
+            audio_int16 = (audio_resampled * 32767).astype(np.int16)
+            sr = target_sr
+        # -------------------------------------------------------
+
+        # 3. メモリ上のファイルオブジェクト(BytesIO)にWAVとして書き込む
+        wav_buffer = io.BytesIO()
+        scipy_write(wav_buffer, sr, audio_int16)
+        
+        # バイト列を取り出す
+        return wav_buffer.getvalue()
+
+    except Exception as e:
+        print(f"[ERROR] Memory Synthesis Error: {e}")
+        return None
+    
 # --- 単体テスト (変更なし) ---
 if __name__ == "__main__":
     print("\n--- Style-Bert-TTS (FineTuned, FlatPath) 単体テスト ---")

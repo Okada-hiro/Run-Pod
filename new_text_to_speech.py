@@ -198,7 +198,7 @@ def synthesize_speech_to_memory(text_to_speak: str) -> bytes:
             audio_float = audio_data.astype(np.float32) / 32768.0
 
         # --- ★高速化ポイント: Scipyでリサンプリング (エラー回避版) ---
-        target_sr = 24000
+        target_sr = 16000
         if sr > target_sr:
             # サンプル数を計算
             num_samples = int(len(audio_float) * float(target_sr) / sr)

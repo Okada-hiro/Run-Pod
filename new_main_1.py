@@ -656,20 +656,46 @@ async def get_root():
                 isPlaying = false;
             }
 
+            // 既存の processAudioQueue をこれに置き換え
             async function processAudioQueue() {
                 if (isPlaying || audioQueue.length === 0) return;
+                
+                // ロックをかける
                 isPlaying = true;
+                
                 const wavData = audioQueue.shift();
+                
                 try {
-                    if (!audioContext || audioContext.state === 'closed') audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                    // AudioContextが寝ていたら叩き起こす（重要）
+                    if (audioContext.state === 'suspended') {
+                        await audioContext.resume();
+                    }
+
+                    // decodeAudioData は遅いので、ここで待たされる可能性がありますが
+                    // WAV形式の場合はこれを使うしかありません。
+                    // ※データサイズを小さくした(16kHz)効果がここで効いてきます
                     const audioBuffer = await audioContext.decodeAudioData(wavData);
+                    
                     const source = audioContext.createBufferSource();
                     source.buffer = audioBuffer;
                     source.connect(audioContext.destination);
                     currentSourceNode = source;
-                    source.onended = () => { currentSourceNode = null; isPlaying = false; processAudioQueue(); };
+                    
+                    source.onended = () => { 
+                        currentSourceNode = null; 
+                        isPlaying = false; 
+                        // 次のデータがあれば間髪入れずに再生
+                        processAudioQueue(); 
+                    };
+                    
                     source.start(0);
-                } catch(e) { isPlaying = false; currentSourceNode = null; }
+                    
+                } catch(e) { 
+                    console.error("再生エラー:", e);
+                    isPlaying = false; 
+                    currentSourceNode = null; 
+                    processAudioQueue(); 
+                }
             }
 
             btnStart.onclick = startRecording;

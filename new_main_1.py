@@ -192,7 +192,7 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
                 # --- ★限界チューニング: 0.1秒刻みで送信 ---
                 
                 # 計算式: 16000Hz * 16bit(2byte) * 0.1秒 = 3200 bytes
-                CHUNK_SIZE = 3200 
+                CHUNK_SIZE = 16000
                 
                 total_len = len(full_wav_bytes)
                 offset = 0

@@ -73,6 +73,17 @@ async def enable_registration():
 # --- ヘルパー: 音声処理パイプライン ---
 async def process_voice_pipeline(audio_float32_np, websocket: WebSocket, chat_history: list):
     global NEXT_AUDIO_IS_REGISTRATION
+
+    # --- ★追加: 自分の声を保存して確認できるようにする ---
+    import soundfile as sf
+    # 毎回上書きされます
+    debug_path = f"{PROCESSING_DIR}/last_user_input.wav"
+    sf.write(debug_path, audio_float32_np, 16000)
+    logger.info(f"🎤 [DEBUG] あなたの声を保存しました: {debug_path}")
+    # --------------------------------------------------
+
+    # SpeakerGuard用に Tensor化
+    voice_tensor = torch.from_numpy(audio_float32_np).float().unsqueeze(0)
     
     # SpeakerGuard用に Tensor化
     voice_tensor = torch.from_numpy(audio_float32_np).float().unsqueeze(0)

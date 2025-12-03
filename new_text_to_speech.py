@@ -97,6 +97,26 @@ try:
         print(f"利用可能な話者: {list(GLOBAL_TTS_MODEL.spk2id.keys())}")
         raise
 
+    # --- ★追加: ウォームアップ処理 (ここから) ---
+    print("[INFO] Style-Bert-TTS (FT): Performing Warm-up (dummy inference)...")
+    try:
+        # 「あ」と一瞬だけ生成させて、CUDAの初期化コストをここで払っておく
+        # 結果は使わないので捨てる
+        _ = GLOBAL_TTS_MODEL.infer(
+            text="あ",
+            language=Languages.JP,
+            speaker_id=GLOBAL_SPEAKER_ID,
+            style="Neutral",
+            style_weight=0.7,
+            sdp_ratio=0.2,
+            noise=0.6,
+            noise_w=0.8,
+            length=0.1 # 最短で終わらせる
+        )
+        print("[INFO] Style-Bert-TTS (FT): Warm-up complete! (Ready for fast inference)")
+    except Exception as wu_e:
+        print(f"[WARNING] Warm-up failed (will proceed anyway): {wu_e}")
+    # --- ★追加: ウォームアップ処理 (ここまで) ---
     print("[INFO] Style-Bert-TTS (FT): All models ready.")
 
 except Exception as e:

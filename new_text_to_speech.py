@@ -169,7 +169,7 @@ from scipy.io.wavfile import write as scipy_write
 
 def synthesize_speech_to_memory(text_to_speak: str) -> bytes:
     """
-    音声をファイルに保存せず、バイトデータとして直接返す（高速化版）
+    音声をファイルに保存せず、バイトデータとして直接返す（Scipy高速化版）
     """
     if GLOBAL_TTS_MODEL is None or GLOBAL_SPEAKER_ID is None:
         return None
@@ -188,25 +188,28 @@ def synthesize_speech_to_memory(text_to_speak: str) -> bytes:
             length=1.0
         )
         
-        # 2. 16bit PCMに変換
+        # 2. 16bit PCMに変換 (正規化)
         if audio_data.dtype != np.int16:
             audio_norm = audio_data / np.abs(audio_data).max()
-            audio_int16 = (audio_norm * 32767).astype(np.int16)
+            # floatのままリサンプリングするためにここではまだint16にしない
+            audio_float = audio_norm
         else:
-            audio_int16 = audio_data
+            audio_float = audio_data.astype(np.float32) / 32768.0
 
-        # --- ★高速化ポイント: ダウンサンプリング (データ量を減らす) ---
-        # Style-Bert-VITS2は通常44.1kHzでデータが重いため、24kHzに落とす
-        # (チャットボットなら24kHzで十分高音質です)
-        import librosa
+        # --- ★高速化ポイント: Scipyでリサンプリング (エラー回避版) ---
         target_sr = 24000
         if sr > target_sr:
-            # float32に戻してリサンプリング
-            audio_float = audio_int16.astype(np.float32) / 32768.0
-            audio_resampled = librosa.resample(audio_float, orig_sr=sr, target_sr=target_sr)
-            # 再びint16へ
+            # サンプル数を計算
+            num_samples = int(len(audio_float) * float(target_sr) / sr)
+            # Scipyでリサンプリング (librosaよりトラブルが少ない)
+            audio_resampled = scipy.signal.resample(audio_float, num_samples)
+            
+            # int16に変換
             audio_int16 = (audio_resampled * 32767).astype(np.int16)
             sr = target_sr
+        else:
+            # リサンプリング不要な場合
+            audio_int16 = (audio_float * 32767).astype(np.int16)
         # -------------------------------------------------------
 
         # 3. メモリ上のファイルオブジェクト(BytesIO)にWAVとして書き込む
@@ -218,6 +221,7 @@ def synthesize_speech_to_memory(text_to_speak: str) -> bytes:
 
     except Exception as e:
         print(f"[ERROR] Memory Synthesis Error: {e}")
+        # エラー時はNoneを返すか、元のファイルを返すなど安全策をとる
         return None
     
 # --- 単体テスト (変更なし) ---

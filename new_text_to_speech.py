@@ -212,13 +212,10 @@ def synthesize_speech_to_memory(text_to_speak: str) -> bytes:
             # リサンプリング不要な場合
             audio_int16 = (audio_float * 32767).astype(np.int16)
         # -------------------------------------------------------
-
-        # 3. メモリ上のファイルオブジェクト(BytesIO)にWAVとして書き込む
-        wav_buffer = io.BytesIO()
-        scipy_write(wav_buffer, sr, audio_int16)
+        # 新しいコード（Raw PCM返却）:
+        # tobytes() でメモリ上の配列をそのままバイナリ化します
+        return audio_int16.tobytes()
         
-        # バイト列を取り出す
-        return wav_buffer.getvalue()
 
     except Exception as e:
         print(f"[ERROR] Memory Synthesis Error: {e}")

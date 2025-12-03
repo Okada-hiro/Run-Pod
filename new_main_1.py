@@ -656,45 +656,66 @@ async def get_root():
                 isPlaying = false;
             }
 
-            // 既存の processAudioQueue をこれに置き換え
+            // ★追加: 再生時間を管理する変数
+            let nextStartTime = 0;
+
             async function processAudioQueue() {
-                if (isPlaying || audioQueue.length === 0) return;
+                if (audioQueue.length === 0) {
+                    isPlaying = false;
+                    return;
+                }
                 
-                // ロックをかける
                 isPlaying = true;
-                
-                const wavData = audioQueue.shift();
+                const rawBytes = audioQueue.shift();
                 
                 try {
-                    // AudioContextが寝ていたら叩き起こす（重要）
                     if (audioContext.state === 'suspended') {
                         await audioContext.resume();
                     }
 
-                    // decodeAudioData は遅いので、ここで待たされる可能性がありますが
-                    // WAV形式の場合はこれを使うしかありません。
-                    // ※データサイズを小さくした(16kHz)効果がここで効いてきます
-                    const audioBuffer = await audioContext.decodeAudioData(wavData);
+                    // --- ★ここが高速化のキモです ---
                     
+                    // 1. 生のバイナリ(Int16)を読み込む
+                    // サーバーから送られてきたのは 16bit整数 の配列です
+                    const int16Data = new Int16Array(rawBytes);
+                    
+                    // 2. ブラウザ用に Float32 (-1.0 ~ 1.0) に変換する
+                    // decodeAudioData を待つ必要がなく、計算だけで終わるため一瞬です
+                    const float32Data = new Float32Array(int16Data.length);
+                    for (let i = 0; i < int16Data.length; i++) {
+                        // 32768で割って正規化
+                        float32Data[i] = int16Data[i] / 32768.0;
+                    }
+
+                    // 3. 再生用バッファを作成 (モノラル, 長さ, 16000Hz)
+                    // ※new_text_to_speech.py の target_sr と合わせる必要があります(今は16000推奨)
+                    const audioBuffer = audioContext.createBuffer(1, float32Data.length, 16000);
+                    
+                    // 4. データをバッファにコピー
+                    audioBuffer.getChannelData(0).set(float32Data);
+
+                    // 5. 隙間なく再生するスケジュール管理
                     const source = audioContext.createBufferSource();
                     source.buffer = audioBuffer;
                     source.connect(audioContext.destination);
-                    currentSourceNode = source;
+
+                    // 現在時刻と、予定時刻を比べて、遅れていれば現在時刻に合わせる
+                    if (nextStartTime < audioContext.currentTime) {
+                        nextStartTime = audioContext.currentTime;
+                    }
                     
-                    source.onended = () => { 
-                        currentSourceNode = null; 
-                        isPlaying = false; 
-                        // 次のデータがあれば間髪入れずに再生
-                        processAudioQueue(); 
-                    };
+                    source.start(nextStartTime);
                     
-                    source.start(0);
+                    // 次の音声の開始予定時間を更新（今の音声の長さ分だけ後ろにずらす）
+                    nextStartTime += audioBuffer.duration;
+
+                    // 再生が終わるのを待たずに、次のデータの準備にすぐ取り掛かる！
+                    // (これで遅延がさらに減ります)
+                    processAudioQueue();
                     
                 } catch(e) { 
-                    console.error("再生エラー:", e);
-                    isPlaying = false; 
-                    currentSourceNode = null; 
-                    processAudioQueue(); 
+                    console.error("Raw再生エラー:", e);
+                    isPlaying = false;
                 }
             }
 

@@ -229,7 +229,7 @@ if __name__ == "__main__":
     if GLOBAL_TTS_MODEL is None:
         print("[FAIL] モデルのグローバルロードに失敗したため、テストを中止します。")
     else:
-        TEST_TEXT = "中心部にあるので、商店や、オフィスに行くのに便利です。鉄鋼生産は、２年連続して、最高を記録した。:１年前、彼に車の運転ができていたらよかったのに。"
+        TEST_TEXT = "こんにちは。今日は、午後から雨が降る予報です。傘は持って行ったほうが安心ですよ"
         TEST_OUTPUT = "/workspace/test_finetuned_output.wav"
         
         print(f"テキスト: {TEST_TEXT}")

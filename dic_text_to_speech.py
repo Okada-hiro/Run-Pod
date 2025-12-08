@@ -28,10 +28,10 @@ def main():
     tts.load_accent_dict(ACCENT_JSON)
 
     # 3. 音声合成
-    text = "今日は、午後から雨が降る予報です。傘は持って行ったほうが安心ですよ。"
+    text = "こんにちは。今日は、午後から雨が降る予報です。傘は持って行ったほうが安心ですよ。"
     output = "final_output.wav"
     
-    tts.infer(text, output)
+    tts.infer(text, output, pitch=1.2)
 
 if __name__ == "__main__":
     main()

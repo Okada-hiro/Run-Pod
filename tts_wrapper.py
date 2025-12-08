@@ -117,7 +117,9 @@ class TTSWrapper:
 
         return phones, tones
 
-    def infer(self, text, output_path, style_weight=0.1, pitch=1.0, intonation=1.0):
+    assist_directive = "プロのニュースキャスターです。落ち着いたトーンで、正確に、明瞭に原稿を読み上げます。"
+
+    def infer(self, text, output_path, style_weight=0.1, pitch=1.0, assist_text_weight=1.5, intonation=1.0, assist_text=None):
         """
         音声合成実行
         """
@@ -134,8 +136,15 @@ class TTSWrapper:
             given_tone=tones, # 修正済みトーン
             style="Neutral",
             style_weight=style_weight,
+
+            # ★ここが魔法のスパイスです
+            assist_text=assist_text,     # 「嬉しい」「悲しい」などの文章
+            assist_text_weight=assist_text_weight,      # どれくらいその口調に寄せるか
+            use_assist_text=True if assist_text else False,
+
             pitch_scale=pitch,
             intonation_scale=intonation,
+
             sdp_ratio=0.0,    # 揺らぎなし（必須）
             noise=0.1,
             noise_w=0.1,

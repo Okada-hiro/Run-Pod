@@ -7,7 +7,7 @@ REPO_PATH = os.path.join(WORKSPACE_DIR, "Style_Bert_VITS2")
 ASSETS_DIR = os.path.join(REPO_PATH, "model_assets")
 
 # モデルファイル名
-MODEL_FILE = "huggingface_Ref_voice_e4_s4.safetensors"
+MODEL_FILE = "demo_Ref_voice_e3_s9.safetensors"
 CONFIG_FILE = "config.json"
 STYLE_FILE = "style_vectors.npy"
 
@@ -30,8 +30,10 @@ def main():
     # 3. 音声合成
     text = "こんにちは。今日は、午後から雨が降る予報です。傘は持って行ったほうが安心ですよ。"
     output = "final_output.wav"
-    
-    tts.infer(text, output, pitch=1.2, intonation=1.4)
+
+    assist_directive = "プロのニュースキャスターです。落ち着いたトーンで、正確に、明瞭に原稿を読み上げます。"
+
+    tts.infer(text, output, pitch=1.2, intonation=1.4, style_weight=0.6, assist_text=assist_directive, )
 
 if __name__ == "__main__":
     main()

@@ -54,6 +54,7 @@ GLOBAL_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 FT_SPEAKER_NAME = "Ref_voice" 
 # model_assets/ 直下に置くファイル名
 FT_MODEL_FILE = "こんにちは_Ref_voice_e3_s3.safetensors"
+FT_MODEL_FILE = "demo_Ref_voice_e3_s9.safetensors"
 FT_CONFIG_FILE = "config.json"
 FT_STYLE_FILE = "style_vectors.npy"
 # ---

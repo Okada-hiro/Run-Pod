@@ -7,6 +7,7 @@ repo_id = "okadahiroaki/new_model"
 filename = "Ref_voice_e3_s936.safetensors"
 filename = "Ref_voice_e3_s1878.safetensors"
 filename ="こんにちは_Ref_voice_e3_s3.safetensors"
+filename = "demo_Ref_voice_e3_s9.safetensors"
 
 # ファイルをローカルにダウンロード
 local_path = hf_hub_download(repo_id=repo_id, filename=filename, local_dir="Style_Bert_VITS2/model_assets")

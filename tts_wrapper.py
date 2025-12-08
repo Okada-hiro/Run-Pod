@@ -117,7 +117,7 @@ class TTSWrapper:
 
         return phones, tones
 
-    def infer(self, text, output_path, style_weight=0.1, pitch=1.0):
+    def infer(self, text, output_path, style_weight=0.1, pitch=1.0, intonation=1.0):
         """
         音声合成実行
         """
@@ -135,6 +135,7 @@ class TTSWrapper:
             style="Neutral",
             style_weight=style_weight,
             pitch_scale=pitch,
+            intonation_scale=intonation,
             sdp_ratio=0.0,    # 揺らぎなし（必須）
             noise=0.1,
             noise_w=0.1,

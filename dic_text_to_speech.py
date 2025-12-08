@@ -31,7 +31,7 @@ def main():
     text = "こんにちは。今日は、午後から雨が降る予報です。傘は持って行ったほうが安心ですよ。"
     output = "final_output.wav"
     
-    tts.infer(text, output, pitch=1.2)
+    tts.infer(text, output, pitch=1.2, intonation=1.4)
 
 if __name__ == "__main__":
     main()

@@ -134,7 +134,7 @@ class TTSWrapper:
             given_tone=tones, # 修正済みトーン
             style="Neutral",
             style_weight=style_weight,
-            pitch_scale=pitch
+            pitch_scale=pitch,
             sdp_ratio=0.0,    # 揺らぎなし（必須）
             noise=0.1,
             noise_w=0.1,

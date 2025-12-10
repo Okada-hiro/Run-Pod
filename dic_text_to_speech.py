@@ -33,7 +33,7 @@ def main():
 
     assist_directive = "プロのニュースキャスターです。落ち着いたトーンで、正確に、明瞭に原稿を読み上げます。"
 
-    tts.infer(text, output, pitch=1.2, intonation=1.4, style_weight=0.6, assist_text=assist_directive, )
+    tts.infer(text, output, pitch=1.2, intonation=1.4, style_weight=0.6, )
 
 if __name__ == "__main__":
     main()

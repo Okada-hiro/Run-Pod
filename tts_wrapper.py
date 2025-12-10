@@ -33,9 +33,7 @@ class TTSWrapper:
 
         self._load_bert()
         self.model = self._load_tts_model(model_assets_dir, model_file, config_file, style_file)
-        # ★モデルロード後に Denoiser を初期化 (self.model.net_g が生成器本体です)
-        print("[INFO] Loading Denoiser...")
-        self.denoiser = self.DenoiserClass(self.model.net_g).to(self.device)
+        
         self.accent_rules = {}
 
     def _load_bert(self):

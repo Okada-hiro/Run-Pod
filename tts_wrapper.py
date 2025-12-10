@@ -5,7 +5,7 @@ import torch
 import numpy as np
 import pyopenjtalk
 from scipy.io.wavfile import write
-import scipy.signal  # ★これを追加（標準的な信号処理ライブラリ）
+import scipy.signal
 from pathlib import Path
 
 class TTSWrapper:
@@ -69,27 +69,22 @@ class TTSWrapper:
     def _parse_openjtalk_accent(self, labels):
         phones = []
         tones = []
-        
         for label in labels:
             parts = label.split('/')
             p3 = label.split('-')[1].split('+')[0]
             if p3 == 'sil': p3 = 'pau'
             phones.append(p3)
-            
             if p3 == 'pau':
                 tones.append(0)
                 continue
-
             try:
                 a_part = parts[1]
                 if 'A:' not in a_part:
                     tones.append(0)
                     continue
-                    
                 nums = a_part.split(':')[1].split('+')
                 a1 = int(nums[0])
                 a2 = int(nums[1])
-                
                 is_high = 0
                 if a1 == 0:
                     if a2 == 1: is_high = 0
@@ -100,11 +95,9 @@ class TTSWrapper:
                         else: is_high = 1
                     else:
                         is_high = 0
-                
                 tones.append(is_high)
             except:
                 tones.append(0)
-
         return phones, tones
 
     def _g2p_and_patch(self, text):
@@ -116,33 +109,30 @@ class TTSWrapper:
             target_tones = rule['tones']
             
             if len(target_phones) != len(target_tones):
-                print(f"[WARNING] Skip '{word}': 音素数不一致")
+                # print(f"[WARNING] Skip '{word}': 音素数不一致")
                 continue
 
             seq_len = len(target_phones)
             for i in range(len(phones) - seq_len + 1):
                 if phones[i : i + seq_len] == target_phones:
-                    print(f"[PATCH] Applying accent fix for '{word}' at index {i}")
+                    # print(f"[PATCH] Applying accent fix for '{word}' at index {i}")
                     for j, t_val in enumerate(target_tones):
                         tones[i + j] = t_val
 
         return phones, tones
 
-    # ★ 変更点: PyTorchの手計算をやめて、Scipyを使います (CPU処理で安全確実)
     def _apply_lowpass_scipy(self, audio_numpy, sr, cutoff):
         if cutoff <= 0 or cutoff >= sr / 2:
             return audio_numpy
 
+        # ★追加: 余計な次元(1, N)などを(N,)に潰す
+        audio_numpy = np.squeeze(audio_numpy)
+
         try:
-            # ナイキスト周波数
             nyquist = 0.5 * sr
             normal_cutoff = cutoff / nyquist
-            
-            # バターワースフィルタの設計 (5次)
-            # sos (Second-Order Sections) 形式を使うと数値的に安定します
+            # 安定性の高いSOS形式でフィルタ作成
             sos = scipy.signal.butter(5, normal_cutoff, btype='low', analog=False, output='sos')
-            
-            # フィルタ適用
             filtered = scipy.signal.sosfilt(sos, audio_numpy)
             return filtered
         except Exception as e:
@@ -155,7 +145,7 @@ class TTSWrapper:
         phones, tones = self._g2p_and_patch(text)
         use_assist = True if assist_text else False
         
-        # 1. 音声生成 (Numpy配列)
+        # 1. 音声生成
         sr, audio_data = self.model.infer(
             text=text,
             language=self.Languages.JP,
@@ -173,23 +163,29 @@ class TTSWrapper:
             noise_w=0.1,
             length=length
         )
+        
+        # Numpy配列であることを確認
+        if not isinstance(audio_data, np.ndarray):
+            audio_data = audio_data.cpu().numpy()
+        
+        # ★重要修正: データ型の正規化（ここがノイズの原因でした）
+        # もし値がすでに大きい(int16スケール)なら、一度 float(-1.0 ~ 1.0) に戻す
+        max_val = np.max(np.abs(audio_data))
+        if max_val > 1.5: 
+            print(f"[INFO] Audio detected as raw int16 scale (max={max_val:.1f}). Normalizing...")
+            audio_data = audio_data / 32768.0
 
-        # 2. Scipyでフィルタ適用 (GPU->CPU変換などが不要で、Numpyのまま処理できるのでバグりません)
+        # 2. フィルタ適用
         if lpf_cutoff > 0:
-            original_max = np.max(np.abs(audio_data))
-            
             audio_data = self._apply_lowpass_scipy(audio_data, sr, lpf_cutoff)
-            
             print(f"[INFO] Applied Scipy Low-pass filter at {lpf_cutoff}Hz")
 
-        # 3. 音量正規化と保存
-        # フィルタをかけると音量が下がることがあるので、少し持ち上げる(オプション)
-        if audio_data.dtype != np.int16:
-            # クリップ処理 (バリバリ音防止)
-            audio_data = np.clip(audio_data, -1.0, 1.0)
-            audio_int16 = (audio_data * 32767).astype(np.int16)
-        else:
-            audio_int16 = audio_data
+        # 3. 保存用に int16 へ変換
+        # まずクリップして四角い波形になるのを防ぐ
+        audio_data = np.clip(audio_data, -1.0, 1.0)
+        
+        # 32767倍してint16にする
+        audio_int16 = (audio_data * 32767).astype(np.int16)
             
         write(output_path, sr, audio_int16)
         print(f"[SUCCESS] Saved to {output_path}")

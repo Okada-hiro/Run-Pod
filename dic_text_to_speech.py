@@ -42,7 +42,7 @@ def main():
         
         # ★以下の2行を追加してください
         assist_text=assist_directive, 
-        assist_text_weight=0.5 # 控えめに効かせる
+        assist_text_weight=0.2 # 控えめに効かせる
     )
 
 if __name__ == "__main__":

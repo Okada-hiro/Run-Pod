@@ -5,6 +5,7 @@ import torch
 import numpy as np
 import pyopenjtalk
 from scipy.io.wavfile import write
+import scipy.signal  # ★これを追加（標準的な信号処理ライブラリ）
 from pathlib import Path
 
 class TTSWrapper:
@@ -12,13 +13,10 @@ class TTSWrapper:
         self.repo_path = repo_path
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         
-        # 【修正】 append ではなく insert(0, ...) を使う
-        # これにより、インストール済みのライブラリよりも先に、手元のフォルダを探しに行きます
         if self.repo_path not in sys.path:
             sys.path.insert(0, self.repo_path) 
             print(f"[INFO] Inserted '{self.repo_path}' to sys.path[0] to force load local modules.")
 
-            
         try:
             from style_bert_vits2.nlp import bert_models
             from style_bert_vits2.constants import Languages
@@ -68,7 +66,6 @@ class TTSWrapper:
             
         print(f"[INFO] Loaded {count} accent rules from {json_path}")
 
-    # ★ここが最重要：OpenJTalkの標準アクセントを計算して復元する機能
     def _parse_openjtalk_accent(self, labels):
         phones = []
         tones = []
@@ -79,27 +76,25 @@ class TTSWrapper:
             if p3 == 'sil': p3 = 'pau'
             phones.append(p3)
             
-            # pau（無音）は0でOK
             if p3 == 'pau':
                 tones.append(0)
                 continue
 
-            # ラベルからアクセント情報を解析して、正しい0/1を計算する
             try:
-                a_part = parts[1] # A:xx+xx+xx
+                a_part = parts[1]
                 if 'A:' not in a_part:
                     tones.append(0)
                     continue
                     
                 nums = a_part.split(':')[1].split('+')
-                a1 = int(nums[0]) # アクセント核
-                a2 = int(nums[1]) # 現在のモーラ番号
+                a1 = int(nums[0])
+                a2 = int(nums[1])
                 
                 is_high = 0
-                if a1 == 0: # 平板型
+                if a1 == 0:
                     if a2 == 1: is_high = 0
                     else:       is_high = 1
-                else: # 起伏型
+                else:
                     if a2 <= a1:
                         if a2 == 1 and a1 > 1: is_high = 0
                         else: is_high = 1
@@ -108,22 +103,20 @@ class TTSWrapper:
                 
                 tones.append(is_high)
             except:
-                tones.append(0) # 解析失敗時のみ0
+                tones.append(0)
 
         return phones, tones
 
     def _g2p_and_patch(self, text):
-        # 1. まず標準的なアクセントを計算（これで0埋めを回避）
         labels = pyopenjtalk.extract_fullcontext(text)
         phones, tones = self._parse_openjtalk_accent(labels)
 
-        # 2. その上で辞書を適用
         for word, rule in self.accent_rules.items():
             target_phones = rule['phones']
             target_tones = rule['tones']
             
             if len(target_phones) != len(target_tones):
-                print(f"[WARNING] Skip '{word}': 音素数({len(target_phones)})とトーン数({len(target_tones)})が不一致")
+                print(f"[WARNING] Skip '{word}': 音素数不一致")
                 continue
 
             seq_len = len(target_phones)
@@ -134,70 +127,35 @@ class TTSWrapper:
                         tones[i + j] = t_val
 
         return phones, tones
-    # ... (既存のメソッド) ...
 
-    # ★ クラス内メソッドとして追加 (self を引数に加え、staticmethod等は使わずシンプルに)
-    def _lowpass_filter(self, audio: torch.Tensor, sr, cutoff):
-        """
-        音声テンソルにローパスフィルタを適用する（修正版：NaN回避）
-        """
-        if cutoff <= 0: return audio
-        
-        # FIRフィルタ設計
-        filter_length = 101
-        
-        # ★ここから修正：計算手順を安全なものに変更
-        # 1. 時間軸 t を float で作成
-        t = torch.arange(-(filter_length // 2), (filter_length // 2) + 1).float().to(audio.device)
-        
-        # 2. 0除算を防ぐため、t=0 の場所を一時的に 1.0 に避難させる
-        # (t=0 の計算は後で上書きするので、ここではダミーの値で計算させます)
-        t_safe = torch.where(t == 0, torch.tensor(1.0).to(audio.device), t)
-        
-        # 3. sinc関数の計算 (t_safeを使うのでエラーにならない)
-        # sin(2πft) / πt
-        sinc = torch.sin(2 * torch.pi * cutoff * t / sr) / (torch.pi * t_safe)
-        
-        # 4. t=0 の時の正しい値 (2fc/sr) を中心に代入
-        # filter_length // 2 がちょうど中心のインデックスです
-        sinc[filter_length // 2] = 2 * cutoff / sr
-        
-        # 窓関数を掛ける
-        window = torch.hann_window(filter_length).to(audio.device)
-        lowpass = sinc * window
-        
-        # 正規化（フィルタの総和を1にする＝音量を変えない）
-        if lowpass.sum() != 0:
-            lowpass = lowpass / lowpass.sum()
-        
-        # ★ここまで修正
-        # audioの形状調整
-        if audio.dim() == 1:
-            audio = audio.view(1, 1, -1)
-        elif audio.dim() == 2:
-            audio = audio.unsqueeze(1)
+    # ★ 変更点: PyTorchの手計算をやめて、Scipyを使います (CPU処理で安全確実)
+    def _apply_lowpass_scipy(self, audio_numpy, sr, cutoff):
+        if cutoff <= 0 or cutoff >= sr / 2:
+            return audio_numpy
 
-        # Conv1d用にフィルタ変形
-        lowpass = lowpass.view(1, 1, -1)
-        
-        # 反射パディング
-        pad_size = filter_length // 2
-        audio_padded = torch.nn.functional.pad(audio, (pad_size, pad_size), mode='reflect')
-
-        # 畳み込み実行
-        filtered = torch.nn.functional.conv1d(audio_padded, lowpass)
-
-        return filtered.squeeze()
-    # ... (infer メソッドへ続く) ...
+        try:
+            # ナイキスト周波数
+            nyquist = 0.5 * sr
+            normal_cutoff = cutoff / nyquist
+            
+            # バターワースフィルタの設計 (5次)
+            # sos (Second-Order Sections) 形式を使うと数値的に安定します
+            sos = scipy.signal.butter(5, normal_cutoff, btype='low', analog=False, output='sos')
+            
+            # フィルタ適用
+            filtered = scipy.signal.sosfilt(sos, audio_numpy)
+            return filtered
+        except Exception as e:
+            print(f"[ERROR] Scipy filter failed: {e}")
+            return audio_numpy
 
     def infer(self, text, output_path, style_weight=0.1, pitch=1.0, assist_text_weight=0.0, intonation=1.3, assist_text=None ,length=1.0, sdp_ratio=0.2, lpf_cutoff=9000):
         print(f"--- Synthesizing: {text[:20]}... ---")
         
-        # 修正版のアクセント生成
         phones, tones = self._g2p_and_patch(text)
-        
         use_assist = True if assist_text else False
         
+        # 1. 音声生成 (Numpy配列)
         sr, audio_data = self.model.infer(
             text=text,
             language=self.Languages.JP,
@@ -205,37 +163,30 @@ class TTSWrapper:
             given_tone=tones,
             style="Neutral",
             style_weight=style_weight,
-            
             assist_text=assist_text,
             assist_text_weight=assist_text_weight,
             use_assist_text=use_assist,
-            
             pitch_scale=pitch,
             intonation_scale=intonation,
-            
-            # ★受け取った値をここで渡すように変更
             sdp_ratio=sdp_ratio,
             noise=0.1,
             noise_w=0.1,
-            length=length   # ← ここで渡す！
-
-
+            length=length
         )
-        # ★ ローパスフィルタ適用処理
-        if lpf_cutoff > 0:
-            # Numpy -> Tensor (GPUへ)
-            audio_tensor = torch.from_numpy(audio_data).float().to(self.device)
-            
-            # フィルタ実行
-            with torch.no_grad():
-                audio_tensor = self._lowpass_filter(audio_tensor, sr, lpf_cutoff)
-            
-            # Tensor -> Numpy
-            audio_data = audio_tensor.cpu().numpy()
-            print(f"[INFO] Applied Low-pass filter at {lpf_cutoff}Hz")
-        
 
+        # 2. Scipyでフィルタ適用 (GPU->CPU変換などが不要で、Numpyのまま処理できるのでバグりません)
+        if lpf_cutoff > 0:
+            original_max = np.max(np.abs(audio_data))
+            
+            audio_data = self._apply_lowpass_scipy(audio_data, sr, lpf_cutoff)
+            
+            print(f"[INFO] Applied Scipy Low-pass filter at {lpf_cutoff}Hz")
+
+        # 3. 音量正規化と保存
+        # フィルタをかけると音量が下がることがあるので、少し持ち上げる(オプション)
         if audio_data.dtype != np.int16:
+            # クリップ処理 (バリバリ音防止)
+            audio_data = np.clip(audio_data, -1.0, 1.0)
             audio_int16 = (audio_data * 32767).astype(np.int16)
         else:
             audio_int16 = audio_data

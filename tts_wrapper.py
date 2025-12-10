@@ -23,15 +23,19 @@ class TTSWrapper:
             from style_bert_vits2.nlp import bert_models
             from style_bert_vits2.constants import Languages
             from style_bert_vits2.tts_model import TTSModel
-            from models.denoiser import Denoiser
+            
             self.TTSModel = TTSModel
             self.bert_models = bert_models
             self.Languages = Languages
+           
         except ImportError as e:
             raise ImportError(f"Style-Bert-VITS2ライブラリが見つかりません: {e}")
 
         self._load_bert()
         self.model = self._load_tts_model(model_assets_dir, model_file, config_file, style_file)
+        # ★モデルロード後に Denoiser を初期化 (self.model.net_g が生成器本体です)
+        print("[INFO] Loading Denoiser...")
+        self.denoiser = self.DenoiserClass(self.model.net_g).to(self.device)
         self.accent_rules = {}
 
     def _load_bert(self):
@@ -132,8 +136,53 @@ class TTSWrapper:
                         tones[i + j] = t_val
 
         return phones, tones
+    # ... (既存のメソッド) ...
 
-    def infer(self, text, output_path, style_weight=0.1, pitch=1.0, assist_text_weight=0.0, intonation=1.3, assist_text=None ,length=1.0, sdp_ratio=0.2):
+    # ★ クラス内メソッドとして追加 (self を引数に加え、staticmethod等は使わずシンプルに)
+    def _lowpass_filter(self, audio: torch.Tensor, sr, cutoff):
+        """
+        音声テンソルにローパスフィルタを適用する。
+        """
+        if cutoff <= 0: return audio # カットオフ0なら何もしない
+        
+        # FIRフィルタ設計
+        filter_length = 101
+        window = torch.hann_window(filter_length).to(audio.device) # deviceを合わせる
+        
+        # ローパスFIR（sincベース）
+        t = torch.arange(-(filter_length // 2), (filter_length // 2) + 1).to(audio.device)
+        
+        # torch.pi が使えるバージョン前提 (古い場合は math.pi に変更)
+        sinc = torch.where(
+            t == 0,
+            torch.tensor(2 * cutoff / sr).to(audio.device),
+            torch.sin(2 * torch.pi * cutoff * t / sr) / (torch.pi * t),
+        )
+
+        lowpass = sinc * window
+        lowpass = lowpass / lowpass.sum()
+
+        # audioの形状調整: [Time] -> [1, 1, Time]
+        if audio.dim() == 1:
+            audio = audio.view(1, 1, -1)
+        elif audio.dim() == 2:
+             # [1, Time] -> [1, 1, Time]
+            audio = audio.unsqueeze(1)
+
+        # Conv1dの重み形状: [OutCh, InCh, Kernel] -> [1, 1, filter_length]
+        lowpass = lowpass.view(1, 1, -1)
+        
+        # 反射パディングを使って端のプチノイズを防ぐ
+        pad_size = filter_length // 2
+        audio_padded = torch.nn.functional.pad(audio, (pad_size, pad_size), mode='reflect')
+
+        filtered = torch.nn.functional.conv1d(audio_padded, lowpass)
+
+        return filtered.squeeze() # [Time] に戻す
+
+    # ... (infer メソッドへ続く) ...
+
+    def infer(self, text, output_path, style_weight=0.1, pitch=1.0, assist_text_weight=0.0, intonation=1.3, assist_text=None ,length=1.0, sdp_ratio=0.2, lpf_cutoff=9000):
         print(f"--- Synthesizing: {text[:20]}... ---")
         
         # 修正版のアクセント生成
@@ -164,6 +213,19 @@ class TTSWrapper:
 
 
         )
+        # ★ ローパスフィルタ適用処理
+        if lpf_cutoff > 0:
+            # Numpy -> Tensor (GPUへ)
+            audio_tensor = torch.from_numpy(audio_data).float().to(self.device)
+            
+            # フィルタ実行
+            with torch.no_grad():
+                audio_tensor = self._lowpass_filter(audio_tensor, sr, lpf_cutoff)
+            
+            # Tensor -> Numpy
+            audio_data = audio_tensor.cpu().numpy()
+            print(f"[INFO] Applied Low-pass filter at {lpf_cutoff}Hz")
+        
 
         if audio_data.dtype != np.int16:
             audio_int16 = (audio_data * 32767).astype(np.int16)

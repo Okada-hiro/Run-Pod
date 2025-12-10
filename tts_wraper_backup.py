@@ -1,3 +1,5 @@
+
+
 import sys
 import os
 import json
@@ -12,12 +14,8 @@ class TTSWrapper:
         self.repo_path = repo_path
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         
-        # 【修正】 append ではなく insert(0, ...) を使う
-        # これにより、インストール済みのライブラリよりも先に、手元のフォルダを探しに行きます
         if self.repo_path not in sys.path:
-            sys.path.insert(0, self.repo_path) 
-            print(f"[INFO] Inserted '{self.repo_path}' to sys.path[0] to force load local modules.")
-
+            sys.path.append(self.repo_path)
             
         try:
             from style_bert_vits2.nlp import bert_models

@@ -49,7 +49,8 @@ def main():
         # ★★★ ここを変更 ★★★
         length=0.9,     # 1.0だと遅いので、0.9 や 0.8 にして速くする
         sdp_ratio=0.0,  # ランダムな引き伸ばしを無効化（「謎の間」を消す）
-        denoise_strength=0.1
+
+        lpf_cutoff=9000
     )
 
 if __name__ == "__main__":

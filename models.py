@@ -408,27 +408,27 @@ class TextEncoder(nn.Module):
         bert_emb = self.bert_proj(bert).transpose(1, 2)
         ja_bert_emb = self.ja_bert_proj(ja_bert).transpose(1, 2)
         en_bert_emb = self.en_bert_proj(en_bert).transpose(1, 2)
-        style_emb = self.style_proj(style_vec.unsqueeze(1))
+        # ★★★ 介入ポイント1: スタイルベクトルを強制的に弱める ★★★
+        # weight引数が無効なNeutralでも、ここで掛ければ効きます。
+        # 0.1 ～ 0.5 くらいで調整してください。0に近づくほど「無個性（ロボット寄り）」になります。
+        style_emb = self.style_proj(style_vec.unsqueeze(1))*0.2
 
-        # --- 【修正】 重みの定義 ---
-        # 1.0 が学習時のデフォルトです。
-        # アクセントを優先させるため、BERTの影響力を 0.3 ～ 0.5 くらいに下げてみてください。
-        bert_weight = 0.1
+       # ★★★ 介入ポイント2: Tone(pyopenjtalk)を強制的に強める ★★★
+        # 通常は 1.0 ですが、これを 2.0 ～ 3.0 にブーストします。
+        tone_boost = 3.0
         
-        # 逆に Tone を少し強める（例: 1.5倍）のも有効ですが、まずは 1.0 で様子見推奨
-        tone_weight = 1.0 
+        # BERTも少し弱めておくと、未知語でのTone優先度が上がります
+        bert_dampen = 0.5
 
         x = (
             self.emb(x)
-            + self.tone_emb(tone) * tone_weight
+            + self.tone_emb(tone) * tone_boost       # Toneを強化
             + self.language_emb(language)
-            + (bert_emb * bert_weight)      # ここを弱める
-            + (ja_bert_emb * bert_weight)   # ここを弱める
-            + (en_bert_emb * bert_weight)   # ここを弱める
-            + style_emb
-        ) * math.sqrt(
-            self.hidden_channels
-        )  # [b, t, h]
+            + (bert_emb * bert_dampen)               # BERTを弱体化
+            + (ja_bert_emb * bert_dampen)
+            + (en_bert_emb * bert_dampen)
+            + style_emb                              # 弱体化済みStyle
+        ) * math.sqrt(self.hidden_channels) # [b, t, h]
         x = torch.transpose(x, 1, -1)  # [b, h, t]
         x_mask = torch.unsqueeze(commons.sequence_mask(x_lengths, x.size(2)), 1).to(
             x.dtype

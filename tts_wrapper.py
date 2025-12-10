@@ -139,45 +139,38 @@ class TTSWrapper:
     # ★ クラス内メソッドとして追加 (self を引数に加え、staticmethod等は使わずシンプルに)
     def _lowpass_filter(self, audio: torch.Tensor, sr, cutoff):
         """
-        音声テンソルにローパスフィルタを適用する。
+        音声テンソルにローパスフィルタを適用する（修正版：NaN回避）
         """
-        if cutoff <= 0: return audio # カットオフ0なら何もしない
+        if cutoff <= 0: return audio
         
         # FIRフィルタ設計
         filter_length = 101
-        window = torch.hann_window(filter_length).to(audio.device) # deviceを合わせる
         
-        # ローパスFIR（sincベース）
-        t = torch.arange(-(filter_length // 2), (filter_length // 2) + 1).to(audio.device)
+        # ★ここから修正：計算手順を安全なものに変更
+        # 1. 時間軸 t を float で作成
+        t = torch.arange(-(filter_length // 2), (filter_length // 2) + 1).float().to(audio.device)
         
-        # torch.pi が使えるバージョン前提 (古い場合は math.pi に変更)
-        sinc = torch.where(
-            t == 0,
-            torch.tensor(2 * cutoff / sr).to(audio.device),
-            torch.sin(2 * torch.pi * cutoff * t / sr) / (torch.pi * t),
-        )
-
+        # 2. 0除算を防ぐため、t=0 の場所を一時的に 1.0 に避難させる
+        # (t=0 の計算は後で上書きするので、ここではダミーの値で計算させます)
+        t_safe = torch.where(t == 0, torch.tensor(1.0).to(audio.device), t)
+        
+        # 3. sinc関数の計算 (t_safeを使うのでエラーにならない)
+        # sin(2πft) / πt
+        sinc = torch.sin(2 * torch.pi * cutoff * t / sr) / (torch.pi * t_safe)
+        
+        # 4. t=0 の時の正しい値 (2fc/sr) を中心に代入
+        # filter_length // 2 がちょうど中心のインデックスです
+        sinc[filter_length // 2] = 2 * cutoff / sr
+        
+        # 窓関数を掛ける
+        window = torch.hann_window(filter_length).to(audio.device)
         lowpass = sinc * window
-        lowpass = lowpass / lowpass.sum()
-
-        # audioの形状調整: [Time] -> [1, 1, Time]
-        if audio.dim() == 1:
-            audio = audio.view(1, 1, -1)
-        elif audio.dim() == 2:
-             # [1, Time] -> [1, 1, Time]
-            audio = audio.unsqueeze(1)
-
-        # Conv1dの重み形状: [OutCh, InCh, Kernel] -> [1, 1, filter_length]
-        lowpass = lowpass.view(1, 1, -1)
         
-        # 反射パディングを使って端のプチノイズを防ぐ
-        pad_size = filter_length // 2
-        audio_padded = torch.nn.functional.pad(audio, (pad_size, pad_size), mode='reflect')
-
-        filtered = torch.nn.functional.conv1d(audio_padded, lowpass)
-
-        return filtered.squeeze() # [Time] に戻す
-
+        # 正規化（フィルタの総和を1にする＝音量を変えない）
+        if lowpass.sum() != 0:
+            lowpass = lowpass / lowpass.sum()
+        
+        # ★ここまで修正
     # ... (infer メソッドへ続く) ...
 
     def infer(self, text, output_path, style_weight=0.1, pitch=1.0, assist_text_weight=0.0, intonation=1.3, assist_text=None ,length=1.0, sdp_ratio=0.2, lpf_cutoff=9000):

@@ -119,7 +119,7 @@ class TTSWrapper:
 
     assist_directive = "プロのニュースキャスターです。落ち着いたトーンで、正確に、明瞭に原稿を読み上げます。"
 
-    def infer(self, text, output_path, style_weight=0.1, pitch=1.0, assist_text_weight=1.5, intonation=1.0, assist_text=None):
+    def infer(self, text, output_path, style_weight=0.1, pitch=1.0, assist_text_weight=0.3, intonation=1.0, assist_text=None):
         """
         音声合成実行
         """

@@ -7,7 +7,7 @@ repo_id = "okadahiroaki/new_model"
 filename = "Ref_voice_e3_s936.safetensors"
 filename = "Ref_voice_e3_s1878.safetensors"
 filename ="こんにちは_Ref_voice_e3_s3.safetensors"
-filename = "demo_Ref_voice_e3_s9.safetensors"
+filename = "elevenvoice_Ref_voice_e5_s35.safetensors"
 
 
 # ファイルをローカルにダウンロード

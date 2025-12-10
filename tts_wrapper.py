@@ -171,6 +171,23 @@ class TTSWrapper:
             lowpass = lowpass / lowpass.sum()
         
         # ★ここまで修正
+        # audioの形状調整
+        if audio.dim() == 1:
+            audio = audio.view(1, 1, -1)
+        elif audio.dim() == 2:
+            audio = audio.unsqueeze(1)
+
+        # Conv1d用にフィルタ変形
+        lowpass = lowpass.view(1, 1, -1)
+        
+        # 反射パディング
+        pad_size = filter_length // 2
+        audio_padded = torch.nn.functional.pad(audio, (pad_size, pad_size), mode='reflect')
+
+        # 畳み込み実行
+        filtered = torch.nn.functional.conv1d(audio_padded, lowpass)
+
+        return filtered.squeeze()
     # ... (infer メソッドへ続く) ...
 
     def infer(self, text, output_path, style_weight=0.1, pitch=1.0, assist_text_weight=0.0, intonation=1.3, assist_text=None ,length=1.0, sdp_ratio=0.2, lpf_cutoff=9000):

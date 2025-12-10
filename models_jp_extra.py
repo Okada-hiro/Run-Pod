@@ -426,9 +426,9 @@ class TextEncoder(nn.Module):
             bert_emb = bert_emb * bert_mask
 
         # 係数の設定
-        tone_boost = 3.0      # Tone(アクセント)を強める！
+        tone_boost = 1.7      # Tone(アクセント)を強める！
         style_weight = 0.2    # Style(変な癖)を弱める
-        bert_dampen = 0.5     # BERT(文脈)を弱める
+        bert_dampen = 0.7     # BERT(文脈)を弱める
 
         # Styleの計算と弱体化
         style_emb = self.style_proj(style_vec.unsqueeze(1)) * style_weight

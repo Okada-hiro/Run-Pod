@@ -43,6 +43,10 @@ def main():
         # ★以下の2行を追加してください
         assist_text=assist_directive, 
         assist_text_weight=0.2 # 控えめに効かせる
+
+        # ★★★ ここを変更 ★★★
+        length=0.8,     # 1.0だと遅いので、0.9 や 0.8 にして速くする
+        sdp_ratio=0.0,  # ランダムな引き伸ばしを無効化（「謎の間」を消す）
     )
 
 if __name__ == "__main__":

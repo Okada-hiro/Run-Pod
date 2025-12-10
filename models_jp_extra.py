@@ -416,29 +416,33 @@ class TextEncoder(nn.Module):
         g: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         bert_emb = self.bert_proj(bert).transpose(1, 2)
-        ja_bert_emb = self.ja_bert_proj(ja_bert).transpose(1, 2)
-        en_bert_emb = self.en_bert_proj(en_bert).transpose(1, 2)
-        # ★★★ 介入ポイント1: スタイルベクトルを強制的に弱める ★★★
-        # weight引数が無効なNeutralでも、ここで掛ければ効きます。
-        # 0.1 ～ 0.5 くらいで調整してください。0に近づくほど「無個性（ロボット寄り）」になります。
-        style_emb = self.style_proj(style_vec.unsqueeze(1))*0.2
-
-       # ★★★ 介入ポイント2: Tone(pyopenjtalk)を強制的に強める ★★★
-        # 通常は 1.0 ですが、これを 2.0 ～ 3.0 にブーストします。
-        tone_boost = 3.0
+        # =========================================================
+        # ★★★ 介入ロジック (JP-Extra専用版) ★★★
+        # =========================================================
         
-        # BERTも少し弱めておくと、未知語でのTone優先度が上がります
-        bert_dampen = 0.5
+        # 学習時の BERT Dropout (モデルにToneを学習させるため必須)
+        if self.training:
+            bert_mask = torch.bernoulli(torch.full((x.size(0), 1, 1), 0.5)).to(x.device)
+            bert_emb = bert_emb * bert_mask
 
+        # 係数の設定
+        tone_boost = 3.0      # Tone(アクセント)を強める！
+        style_weight = 0.2    # Style(変な癖)を弱める
+        bert_dampen = 0.5     # BERT(文脈)を弱める
+
+        # Styleの計算と弱体化
+        style_emb = self.style_proj(style_vec.unsqueeze(1)) * style_weight
+
+        # 最終的な足し算 (ja_bertなどは存在しないので削除)
         x = (
             self.emb(x)
             + self.tone_emb(tone) * tone_boost       # Toneを強化
             + self.language_emb(language)
-            + (bert_emb * bert_dampen)               # BERTを弱体化
-            + (ja_bert_emb * bert_dampen)
-            + (en_bert_emb * bert_dampen)
-            + style_emb                              # 弱体化済みStyle
-        ) * math.sqrt(self.hidden_channels) # [b, t, h]
+            + (bert_emb * bert_dampen)               # 唯一のBERTを弱める
+            + style_emb
+        ) * math.sqrt(self.hidden_channels)
+        
+        # ... (以下そのまま)
         x = torch.transpose(x, 1, -1)  # [b, h, t]
         x_mask = torch.unsqueeze(commons.sequence_mask(x_lengths, x.size(2)), 1).to(
             x.dtype

@@ -157,8 +157,8 @@ class TTSWrapper:
             
             # ★受け取った値をここで渡すように変更
             sdp_ratio=sdp_ratio,
-            noise=0.1,
-            noise_w=0.1,
+            noise=0.6,
+            noise_w=0.8,
             length=length   # ← ここで渡す！
 
 

@@ -132,7 +132,7 @@ class TTSWrapper:
 
         return phones, tones
 
-    def infer(self, text, output_path, style_weight=0.1, pitch=1.0, assist_text_weight=0.0, intonation=1.3, assist_text=None):
+    def infer(self, text, output_path, style_weight=0.1, pitch=1.0, assist_text_weight=0.0, intonation=1.3, assist_text=None ,length=1.0, sdp_ratio=0.2):
         print(f"--- Synthesizing: {text[:20]}... ---")
         
         # 修正版のアクセント生成
@@ -155,10 +155,13 @@ class TTSWrapper:
             pitch_scale=pitch,
             intonation_scale=intonation,
             
-            sdp_ratio=0.0,
+            # ★受け取った値をここで渡すように変更
+            sdp_ratio=sdp_ratio,
             noise=0.1,
             noise_w=0.1,
-            length=1.0
+            length=length   # ← ここで渡す！
+
+
         )
 
         if audio_data.dtype != np.int16:

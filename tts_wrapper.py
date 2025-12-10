@@ -23,6 +23,7 @@ class TTSWrapper:
             from style_bert_vits2.nlp import bert_models
             from style_bert_vits2.constants import Languages
             from style_bert_vits2.tts_model import TTSModel
+            from models.denoiser import Denoiser
             self.TTSModel = TTSModel
             self.bert_models = bert_models
             self.Languages = Languages

@@ -31,9 +31,18 @@ def main():
     text = "こんにちは。今日は、午後から雨が降る予報です。傘は持って行ったほうが安心ですよ。"
     output = "final_output.wav"
 
-    assist_directive = "プロのニュースキャスターです。落ち着いたトーンで、正確に、明瞭に原稿を読み上げます。"
+    assist_directive = "コールセンターの自動音声です。はきはきと、明瞭に喋ります。"
 
-    tts.infer(text, output, pitch=1.2, intonation=1.4, style_weight=0.6, )
+    # パラメータを少し緩めて、「辞書優先」にします
+    tts.infer(text, output, 
+        pitch=1.2, 
+        intonation=1.0,        # 1.4は強すぎます。1.0で十分です。
+        style_weight=0.1,      # 0.6は強すぎます。0.1に下げてください。
+        
+        # ★以下の2行を追加してください
+        assist_text=assist_directive, 
+        assist_text_weight=0.5 # 控えめに効かせる
+    )
 
 if __name__ == "__main__":
     main()

@@ -12,11 +12,9 @@ class TTSWrapper:
         self.repo_path = repo_path
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         
-        # パス設定
         if self.repo_path not in sys.path:
             sys.path.append(self.repo_path)
             
-        # ライブラリインポート
         try:
             from style_bert_vits2.nlp import bert_models
             from style_bert_vits2.constants import Languages
@@ -27,11 +25,8 @@ class TTSWrapper:
         except ImportError as e:
             raise ImportError(f"Style-Bert-VITS2ライブラリが見つかりません: {e}")
 
-        # モデルロード
         self._load_bert()
         self.model = self._load_tts_model(model_assets_dir, model_file, config_file, style_file)
-        
-        # アクセント辞書の初期化
         self.accent_rules = {}
 
     def _load_bert(self):
@@ -50,10 +45,6 @@ class TTSWrapper:
         )
 
     def load_accent_dict(self, json_path):
-        """
-        JSONファイルからアクセント辞書を読み込み、
-        検索用に「音素列」を事前計算しておく
-        """
         if not os.path.exists(json_path):
             print(f"[WARNING] Accent JSON not found: {json_path}")
             return
@@ -63,95 +54,109 @@ class TTSWrapper:
 
         count = 0
         for word, tones in data.items():
-            # 単語から音素列(target_phones)を生成
-            # ※pyopenjtalkを使って「その単語がどう分解されるか」を取得
             phones = pyopenjtalk.g2p(word, kana=False).split(" ")
-            
-            # pau(無音)が含まれる場合があるため除去
             phones = [p for p in phones if p not in ('pau', 'sil')]
-            
-            # 登録
-            self.accent_rules[word] = {
-                "phones": phones,
-                "tones": tones
-            }
+            self.accent_rules[word] = {"phones": phones, "tones": tones}
             count += 1
             
         print(f"[INFO] Loaded {count} accent rules from {json_path}")
 
-    def _g2p_and_patch(self, text):
-        """
-        テキスト全体の音素を取得し、辞書にある単語のアクセントを上書きする
-        """
-        # 1. 全体の音素取得
-        labels = pyopenjtalk.extract_fullcontext(text)
+    # ★ここが最重要：OpenJTalkの標準アクセントを計算して復元する機能
+    def _parse_openjtalk_accent(self, labels):
         phones = []
-        tones = [] # 初期値は全て0
-
+        tones = []
+        
         for label in labels:
             parts = label.split('/')
             p3 = label.split('-')[1].split('+')[0]
             if p3 == 'sil': p3 = 'pau'
             phones.append(p3)
-            tones.append(0) # デフォルト0
+            
+            # pau（無音）は0でOK
+            if p3 == 'pau':
+                tones.append(0)
+                continue
 
-        # 2. 辞書ルールに基づいてパッチ当て
+            # ラベルからアクセント情報を解析して、正しい0/1を計算する
+            try:
+                a_part = parts[1] # A:xx+xx+xx
+                if 'A:' not in a_part:
+                    tones.append(0)
+                    continue
+                    
+                nums = a_part.split(':')[1].split('+')
+                a1 = int(nums[0]) # アクセント核
+                a2 = int(nums[1]) # 現在のモーラ番号
+                
+                is_high = 0
+                if a1 == 0: # 平板型
+                    if a2 == 1: is_high = 0
+                    else:       is_high = 1
+                else: # 起伏型
+                    if a2 <= a1:
+                        if a2 == 1 and a1 > 1: is_high = 0
+                        else: is_high = 1
+                    else:
+                        is_high = 0
+                
+                tones.append(is_high)
+            except:
+                tones.append(0) # 解析失敗時のみ0
+
+        return phones, tones
+
+    def _g2p_and_patch(self, text):
+        # 1. まず標準的なアクセントを計算（これで0埋めを回避）
+        labels = pyopenjtalk.extract_fullcontext(text)
+        phones, tones = self._parse_openjtalk_accent(labels)
+
+        # 2. その上で辞書を適用
         for word, rule in self.accent_rules.items():
             target_phones = rule['phones']
             target_tones = rule['tones']
             
-            # 音素数が合わない場合はスキップ（安全装置）
             if len(target_phones) != len(target_tones):
                 print(f"[WARNING] Skip '{word}': 音素数({len(target_phones)})とトーン数({len(target_tones)})が不一致")
                 continue
 
-            # 全体の中からターゲット音素列を探す（全箇所置換）
             seq_len = len(target_phones)
             for i in range(len(phones) - seq_len + 1):
-                # 音素列が一致するか？
                 if phones[i : i + seq_len] == target_phones:
-                    # 一致したらトーンを上書き
                     print(f"[PATCH] Applying accent fix for '{word}' at index {i}")
                     for j, t_val in enumerate(target_tones):
                         tones[i + j] = t_val
 
         return phones, tones
 
-    assist_directive = "プロのニュースキャスターです。落ち着いたトーンで、正確に、明瞭に原稿を読み上げます。"
-
-    def infer(self, text, output_path, style_weight=0.1, pitch=1.0, assist_text_weight=0.0, intonation=1.0, assist_text=None):
-        """
-        音声合成実行
-        """
+    def infer(self, text, output_path, style_weight=0.1, pitch=1.0, assist_text_weight=0.0, intonation=1.3, assist_text=None):
         print(f"--- Synthesizing: {text[:20]}... ---")
         
-        # アクセント修正処理
+        # 修正版のアクセント生成
         phones, tones = self._g2p_and_patch(text)
         
-        # 推論
+        use_assist = True if assist_text else False
+        
         sr, audio_data = self.model.infer(
             text=text,
             language=self.Languages.JP,
             given_phone=phones,
-            given_tone=tones, # 修正済みトーン
+            given_tone=tones,
             style="Neutral",
             style_weight=style_weight,
-
-            # ★ここが魔法のスパイスです
-            assist_text=assist_text,     # 「嬉しい」「悲しい」などの文章
-            assist_text_weight=assist_text_weight,      # どれくらいその口調に寄せるか
-            use_assist_text=True if assist_text else False,
-
+            
+            assist_text=assist_text,
+            assist_text_weight=assist_text_weight,
+            use_assist_text=use_assist,
+            
             pitch_scale=pitch,
             intonation_scale=intonation,
-
-            sdp_ratio=0.0,    # 揺らぎなし（必須）
+            
+            sdp_ratio=0.0,
             noise=0.1,
             noise_w=0.1,
             length=1.0
         )
 
-        # 保存
         if audio_data.dtype != np.int16:
             audio_int16 = (audio_data * 32767).astype(np.int16)
         else:

@@ -415,6 +415,9 @@ class TextEncoder(nn.Module):
         style_vec: torch.Tensor,
         g: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        bert_emb = self.bert_proj(bert).transpose(1, 2)
+        ja_bert_emb = self.ja_bert_proj(ja_bert).transpose(1, 2)
+        en_bert_emb = self.en_bert_proj(en_bert).transpose(1, 2)
         # ★★★ 介入ポイント1: スタイルベクトルを強制的に弱める ★★★
         # weight引数が無効なNeutralでも、ここで掛ければ効きます。
         # 0.1 ～ 0.5 くらいで調整してください。0に近づくほど「無個性（ロボット寄り）」になります。

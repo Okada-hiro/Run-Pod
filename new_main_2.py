@@ -1,5 +1,4 @@
-# /workspace/new_main_2.py
-# Fixed: Subtitle Order (User first, then AI) & Toast Position (Bottom)
+#今はこれ! 11/28 15:18
 
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -13,7 +12,6 @@ import sys
 import os
 import io
 import re
-import random
 
 # --- ロギング設定 ---
 logging.basicConfig(
@@ -26,8 +24,8 @@ logger = logging.getLogger(__name__)
 # --- 必要なモジュールのインポート ---
 try:
     from transcribe_func import GLOBAL_ASR_MODEL_INSTANCE
-    from supporter_generator import generate_answer_stream, generate_quick_ack
-    from new_text_to_speech import synthesize_speech
+    from new_answer_generator import generate_answer_stream
+    from new_text_to_speech import synthesize_speech, synthesize_speech_to_memory
     from speaker_filter import SpeakerGuard
 except ImportError as e:
     logger.error(f"[ERROR] 必要なモジュールが見つかりません: {e}")
@@ -36,7 +34,6 @@ except ImportError as e:
 # --- グローバル設定 ---
 PROCESSING_DIR = "incoming_audio"
 os.makedirs(PROCESSING_DIR, exist_ok=True)
-
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 logger.info(f"Using Device: {DEVICE}")
 
@@ -76,13 +73,27 @@ async def enable_registration():
 # --- ヘルパー: 音声処理パイプライン ---
 async def process_voice_pipeline(audio_float32_np, websocket: WebSocket, chat_history: list):
     global NEXT_AUDIO_IS_REGISTRATION
+
+    # --- ★追加: 自分の声を保存して確認できるようにする ---
+    import soundfile as sf
+    # 毎回上書きされます
+    debug_path = f"{PROCESSING_DIR}/last_user_input.wav"
+    sf.write(debug_path, audio_float32_np, 16000)
+    logger.info(f"🎤 [DEBUG] あなたの声を保存しました: {debug_path}")
+    # --------------------------------------------------
+
+    # SpeakerGuard用に Tensor化
+    voice_tensor = torch.from_numpy(audio_float32_np).float().unsqueeze(0)
     
+    # SpeakerGuard用に Tensor化
     voice_tensor = torch.from_numpy(audio_float32_np).float().unsqueeze(0)
     
     speaker_id = "Unknown"
     is_allowed = False
 
-    # 1. 話者判定 / 登録
+    # ---------------------------
+    # 1. 話者判定 / 登録ロジック
+    # ---------------------------
     if NEXT_AUDIO_IS_REGISTRATION:
         temp_reg_path = f"{PROCESSING_DIR}/reg_{id(audio_float32_np)}.wav"
         import soundfile as sf
@@ -98,11 +109,13 @@ async def process_voice_pipeline(audio_float32_np, websocket: WebSocket, chat_hi
         else:
             await websocket.send_json({"status": "error", "message": "登録に失敗しました"})
             return
+            
     else:
         is_allowed, detected_id = await asyncio.to_thread(speaker_guard.identify_speaker, voice_tensor)
         speaker_id = detected_id
 
-    # 2. アクセス制御
+    # ---------------------------
+    #  2. アクセス制御
     if not is_allowed:
         # ★★★ ここを修正: 短い音声の誤検知対策 ★★★
         # 音声の長さを秒単位で計算 (サンプル数 / サンプリングレート)
@@ -123,7 +136,9 @@ async def process_voice_pipeline(audio_float32_np, websocket: WebSocket, chat_hi
         })
         return
 
+    # ---------------------------
     # 3. Whisper 文字起こし
+    # ---------------------------
     try:
         if GLOBAL_ASR_MODEL_INSTANCE is None:
             raise ValueError("Whisper Model not loaded")
@@ -142,39 +157,16 @@ async def process_voice_pipeline(audio_float32_np, websocket: WebSocket, chat_hi
 
         text_with_context = f"【{speaker_id}】 {text}"
         logger.info(f"[TASK] {text_with_context}")
-        
-        # --- ★★★ [修正点1] ユーザーの字幕を「先に」送信する ★★★ ---
-        # これにより、UI上で「ユーザー発言」→「AI相槌」の正しい順序になります
+
         await websocket.send_json({
             "status": "transcribed",
             "question_text": text,
             "speaker_id": speaker_id 
         })
 
-        # --- ★★★ Phase A: 相槌 (Lite) ★★★ ---
-        logger.info("🚀 [Lite] Generating Aizuchi...")
-        ack_text = await asyncio.to_thread(generate_quick_ack, text)
-        
-        if ack_text:
-            logger.info(f"🚀 [Lite] Aizuchi: {ack_text}")
-            
-            # AIの相槌字幕を表示
-            await websocket.send_json({
-                "status": "reply_chunk", 
-                "text_chunk": ack_text + "\n" 
-            })
-
-            ack_wav_path = os.path.join(PROCESSING_DIR, "ack_temp.wav")
-            ack_success = await asyncio.to_thread(synthesize_speech, ack_text, ack_wav_path)
-            
-            if ack_success:
-                with open(ack_wav_path, 'rb') as f:
-                    ack_bytes = f.read()
-                await websocket.send_bytes(ack_bytes)
-        
-        # --- ★★★ Phase B: 本回答 (Main) ★★★ ---
-        # ユーザー字幕送信はすでに上で完了しているのでここでは不要
-
+        # ---------------------------
+        # 4. LLM & TTS ストリーミング
+        # ---------------------------
         await handle_llm_tts(text_with_context, websocket, chat_history)
 
     except Exception as e:
@@ -191,23 +183,42 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
 
     iterator = generate_answer_stream(text_for_llm, history=chat_history)
 
+    # 修正版 send_audio_chunk (new_main_1.py用)
     async def send_audio_chunk(phrase, idx):
-        filename = f"resp_{idx}.wav"
-        path = os.path.join(PROCESSING_DIR, filename)
-        success = await asyncio.to_thread(synthesize_speech, phrase, path)
-        if success:
-            with open(path, 'rb') as f:
-                wav_data = f.read()
+        # 生成 (恐らく44.1kHzか24kHz)
+        full_wav_bytes = await asyncio.to_thread(synthesize_speech_to_memory, phrase)
+        
+        if full_wav_bytes:
             try:
-                await websocket.send_bytes(wav_data)
-            except RuntimeError:
-                pass
+                # --- ここから復元・追加 ---
+                import torchaudio
+                import io
+                
+                # 1. メモリ上のデータを読み込む
+                wav_tensor, sample_rate = torchaudio.load(io.BytesIO(full_wav_bytes))
+                
+                # 2. 強制的に16kHzに変換 (これで軽くなる)
+                if sample_rate != 16000:
+                    resampler = torchaudio.transforms.Resample(sample_rate, 16000).to(DEVICE)
+                    wav_tensor = resampler(wav_tensor.to(DEVICE)).cpu()
+                
+                # 3. 変換したデータをバイト列に戻す
+                out_io = io.BytesIO()
+                torchaudio.save(out_io, wav_tensor, 16000, format="wav", bits_per_sample=16)
+                resampled_bytes = out_io.getvalue()
+                
+                # 4. 送信 (小刻みにせず、一文ドンと送るのが今のトレンドですが、小刻みでもOK)
+                await websocket.send_bytes(resampled_bytes)
+                # -----------------------
 
+            except Exception as e:
+                logger.error(f"Error: {e}")
     try:
         for chunk in iterator:
             text_buffer += chunk
             full_answer += chunk
             
+            # ★ "irrelevant" タイプとして送信
             if full_answer.strip() == "[SILENCE]":
                 await websocket.send_json({
                     "status": "system_alert", 
@@ -249,9 +260,9 @@ async def websocket_endpoint(websocket: WebSocket):
     
     vad_iterator = VADIterator(
         vad_model, 
-        threshold=0.5, 
+        threshold=0.95, 
         sampling_rate=16000, 
-        min_silence_duration_ms=1000, 
+        min_silence_duration_ms=200, 
         speech_pad_ms=50
     )
 
@@ -261,8 +272,7 @@ async def websocket_endpoint(websocket: WebSocket):
     
     WINDOW_SIZE_SAMPLES = 512 
     SAMPLE_RATE = 16000
-    CHECK_SPEAKER_SAMPLES = 30000 
-
+    CHECK_SPEAKER_SAMPLES = 30000
     
     chat_history = []
 
@@ -306,7 +316,6 @@ async def websocket_endpoint(websocket: WebSocket):
                         audio_buffer.append(window_np)
                         
                         current_len = sum(len(c) for c in audio_buffer)
-                        
                         if not interruption_triggered and not NEXT_AUDIO_IS_REGISTRATION and current_len > CHECK_SPEAKER_SAMPLES:
                             temp_audio = np.concatenate(audio_buffer)
                             temp_tensor = torch.from_numpy(temp_audio).float().unsqueeze(0)
@@ -314,7 +323,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             is_verified, spk_id = await asyncio.to_thread(speaker_guard.identify_speaker, temp_tensor)
                             
                             if is_verified:
-                                logger.info(f"⚡ [Barge-in] {spk_id} の声を検知(1.5s以上)！停止指示。")
+                                logger.info(f"⚡ [Barge-in] {spk_id} の声を検知！停止指示。")
                                 await websocket.send_json({"status": "interrupt", "message": "🛑 音声停止"})
                                 interruption_triggered = True
 
@@ -327,7 +336,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
 
 # ---------------------------
-# フロントエンド (CSS修正版)
+# フロントエンド (Toast通知 & UI改善)
 # ---------------------------
 @app.get("/", response_class=HTMLResponse)
 async def get_root():
@@ -359,6 +368,7 @@ async def get_root():
             .row { display: flex; width: 100%; margin-bottom: 8px; flex-direction: column; }
             .row.ai { align-items: flex-start; }
             .row.user { align-items: flex-end; }
+            /* システムメッセージ用に行全体を中央揃えにする */
             .row.system { align-items: center; margin-bottom: 12px; }
             
             .speaker-name { font-size: 0.75rem; color: #8696a0; margin-bottom: 2px; margin-left: 5px; margin-right: 5px;}
@@ -370,35 +380,36 @@ async def get_root():
             }
             .ai .bubble { background: #202c33; color: #e9edef; border-top-left-radius: 0; }
             
+            /* ユーザー色分け */
             .user-type-0 .bubble { background: #005c4b; color: #e9edef; border-top-right-radius: 0; }
             .user-type-1 .bubble { background: #0078d4; color: #fff; border-top-right-radius: 0; }
             .user-type-2 .bubble { background: #6b63ff; color: #fff; border-top-right-radius: 0; }
             .user-type-unknown .bubble { background: #374045; color: #e9edef; border-top-right-radius: 0; }
             
+            /* ★システム警告(無関係な内容)用スタイル - 視認性改善★ */
             .system-bubble {
-                background: #4a3b00;         
-                color: #ffecb3;              
+                background: #4a3b00;         /* 暗めのオレンジ背景 */
+                color: #ffecb3;              /* 明るいクリーム色の文字 */
                 font-size: 0.85rem;
                 padding: 6px 16px;
                 border-radius: 16px;
-                border: 1px solid #ffb300;   
+                border: 1px solid #ffb300;   /* 明るいオレンジの枠線 */
                 text-align: center;
                 max-width: 90%;
                 font-weight: 500;
                 box-shadow: 0 2px 5px rgba(0,0,0,0.3);
             }
 
-            /* --- ★★★ [修正点2] Toastの位置を下部(黒いエリア)へ変更 ★★★ --- */
+            /* ★未登録の声用 Toast通知スタイル★ */
             #toast-container {
                 position: absolute;
-                top: auto;        /* 上部指定を解除 */
-                bottom: 20px;     /* 下から20px (コントロールパネル付近) */
+                top: 70px; /* ヘッダーの下 */
                 left: 50%;
                 transform: translateX(-50%);
                 z-index: 100;
                 width: 90%;
                 max-width: 400px;
-                pointer-events: none; /* 下にあってもボタンを押せるように透過 */
+                pointer-events: none; /* クリックを透過(ボタン以外) */
             }
             .toast {
                 background: rgba(30, 30, 30, 0.95);
@@ -406,19 +417,18 @@ async def get_root():
                 padding: 12px 16px;
                 border-radius: 8px;
                 box-shadow: 0 4px 12px rgba(0,0,0,0.5);
-                border-left: 4px solid #f44336; 
+                border-left: 4px solid #f44336; /* 赤いアクセント */
                 margin-bottom: 10px;
                 font-size: 0.9rem;
                 display: flex;
                 flex-direction: column;
                 gap: 8px;
                 opacity: 0;
-                animation: slideDown 0.3s forwards, fadeOut 0.5s forwards 2.5s; 
-                pointer-events: auto; /* ボタンは押せるようにする */
+                animation: slideDown 0.3s forwards, fadeOut 0.5s forwards 2.5s; /* 2.5秒後に消える */
+                pointer-events: auto;
             }
             
-            /* 下から出るのでアニメーション方向も逆にすると自然 */
-            @keyframes slideDown { from { transform: translateY(20px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+            @keyframes slideDown { from { transform: translateY(-20px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
             @keyframes fadeOut { from { opacity: 1; } to { opacity: 0; visibility: hidden; } }
 
             .toast-btn {
@@ -452,8 +462,7 @@ async def get_root():
                 <button id="btn-register">＋ メンバー追加</button>
             </header>
             
-            <div id="toast-container"></div>
-            <div id="chat-box"></div>
+            <div id="toast-container"></div> <div id="chat-box"></div>
             
             <div id="controls">
                 <div id="status">接続待機中...</div>
@@ -480,46 +489,66 @@ async def get_root():
             let isPlaying = false;
             let currentSourceNode = null;
             let currentAiBubble = null;
+            
+            // ★「今後表示しない」設定
             let muteUnregisteredWarning = false;
 
+            // --- Toast通知機能 ---
             function showToast(message) {
                 if (muteUnregisteredWarning) return;
+
                 const toast = document.createElement('div');
                 toast.className = 'toast';
+                
                 const msgText = document.createElement('span');
                 msgText.textContent = message;
+                
                 const muteBtn = document.createElement('button');
                 muteBtn.className = 'toast-btn';
                 muteBtn.textContent = "今後このメッセージを表示しない";
                 muteBtn.onclick = () => {
                     muteUnregisteredWarning = true;
-                    toast.style.display = 'none';
+                    toast.style.display = 'none'; // 即座に消す
                 };
+
                 toast.appendChild(msgText);
                 toast.appendChild(muteBtn);
                 toastContainer.appendChild(toast);
-                setTimeout(() => { if (toast.parentNode) toast.parentNode.removeChild(toast); }, 3000);
+
+                // アニメーション終了後にDOMから削除 (3s)
+                setTimeout(() => {
+                    if (toast.parentNode) toast.parentNode.removeChild(toast);
+                }, 3000);
             }
 
+            // --- チャットログ表示 ---
             function logChat(role, text, speakerId = null) {
                 const row = document.createElement('div');
                 row.className = `row ${role}`;
+                
                 const bubble = document.createElement('div');
 
                 if (role === 'system') {
+                    // システム(無関係)の場合は専用スタイル
                     bubble.className = 'system-bubble';
                     bubble.textContent = text;
                 } else {
+                    // 通常メッセージ
                     bubble.className = 'bubble';
                     bubble.textContent = text;
+                    
                     if (role === 'user' && speakerId) {
                         const nameLabel = document.createElement('div');
                         nameLabel.className = 'speaker-name';
                         nameLabel.textContent = speakerId; 
-                        row.insertBefore(nameLabel, row.firstChild);
+                        row.insertBefore(nameLabel, row.firstChild); // 名前後入れ調整
+                        
                         const idNum = speakerId.replace('User ', '');
-                        if (!isNaN(idNum)) { row.classList.add(`user-type-${idNum}`); } 
-                        else { row.classList.add('user-type-unknown'); }
+                        if (!isNaN(idNum)) {
+                            row.classList.add(`user-type-${idNum}`);
+                        } else {
+                            row.classList.add('user-type-unknown');
+                        }
                     } else if (role === 'ai') {
                          const nameLabel = document.createElement('div');
                         nameLabel.className = 'speaker-name';
@@ -527,6 +556,7 @@ async def get_root():
                         row.insertBefore(nameLabel, row.firstChild);
                     }
                 }
+                
                 row.appendChild(bubble);
                 chatBox.appendChild(row);
                 chatBox.scrollTop = chatBox.scrollHeight;
@@ -550,6 +580,7 @@ async def get_root():
                     socket.binaryType = 'arraybuffer';
 
                     socket.onopen = async () => {
+                        console.log("WS Connected");
                         statusDiv.textContent = "🎙️ 準備OK";
                         statusDiv.style.color = "#e9edef";
                         btnStart.style.display = 'none';
@@ -563,38 +594,60 @@ async def get_root():
                             processAudioQueue();
                         } else {
                             const data = JSON.parse(event.data);
-                            if (data.status === 'processing') statusDiv.textContent = data.message;
-                            if (data.status === 'interrupt') stopAudioPlayback();
-                            if (data.status === 'system_info') logChat('ai', data.message);
+                            
+                            if (data.status === 'processing') {
+                                statusDiv.textContent = data.message;
+                            }
+                            if (data.status === 'interrupt') {
+                                stopAudioPlayback();
+                            }
+                            if (data.status === 'system_info') {
+                                logChat('ai', data.message);
+                            }
 
+                            // ★ アラート分岐処理 ★
                             if (data.status === 'system_alert') {
-                                if (data.alert_type === 'unregistered') showToast(data.message);
-                                else if (data.alert_type === 'irrelevant') logChat('system', data.message);
+                                if (data.alert_type === 'unregistered') {
+                                    // 未登録 -> Toast表示
+                                    showToast(data.message);
+                                } else if (data.alert_type === 'irrelevant') {
+                                    // 無関係 -> ログ表示(色調整済み)
+                                    logChat('system', data.message);
+                                }
                                 statusDiv.textContent = "待機中...";
                             }
 
-                            if (data.status === 'transcribed') logChat('user', data.question_text, data.speaker_id);
+                            if (data.status === 'transcribed') {
+                                logChat('user', data.question_text, data.speaker_id);
+                            }
+
                             if (data.status === 'reply_chunk') {
-                                if (!currentAiBubble) currentAiBubble = logChat('ai', ''); 
+                                if (!currentAiBubble) {
+                                    currentAiBubble = logChat('ai', ''); 
+                                }
                                 currentAiBubble.textContent += data.text_chunk;
                                 chatBox.scrollTop = chatBox.scrollHeight;
                             }
                             if (data.status === 'complete') {
-                                if (!currentAiBubble && data.answer_text) logChat('ai', data.answer_text);
+                                if (!currentAiBubble && data.answer_text) {
+                                    logChat('ai', data.answer_text);
+                                }
                                 currentAiBubble = null;
                                 statusDiv.textContent = "🎙️ 準備OK";
                             }
                         }
                     };
                     socket.onclose = () => stopRecording();
-                } catch (e) { console.error(e); }
+                } catch (e) {
+                    console.error(e);
+                }
             }
 
             async function initAudioStream() {
                 audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
                 const stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
                 sourceInput = audioContext.createMediaStreamSource(stream);
-                processor = audioContext.createScriptProcessor(4096, 1, 1);
+                processor = audioContext.createScriptProcessor(512, 1, 1);
                 processor.onaudioprocess = (e) => {
                     if (!socket || socket.readyState !== WebSocket.OPEN) return;
                     socket.send(e.inputBuffer.getChannelData(0).buffer);
@@ -621,20 +674,67 @@ async def get_root():
                 isPlaying = false;
             }
 
+            // ★追加: 再生時間を管理する変数
+            let nextStartTime = 0;
+
             async function processAudioQueue() {
-                if (isPlaying || audioQueue.length === 0) return;
+                if (audioQueue.length === 0) {
+                    isPlaying = false;
+                    return;
+                }
+                
                 isPlaying = true;
-                const wavData = audioQueue.shift();
+                const rawBytes = audioQueue.shift();
+                
                 try {
-                    if (!audioContext || audioContext.state === 'closed') audioContext = new (window.AudioContext || window.webkitAudioContext)();
-                    const audioBuffer = await audioContext.decodeAudioData(wavData);
+                    if (audioContext.state === 'suspended') {
+                        await audioContext.resume();
+                    }
+
+                    // --- ★ここが高速化のキモです ---
+                    
+                    // 1. 生のバイナリ(Int16)を読み込む
+                    // サーバーから送られてきたのは 16bit整数 の配列です
+                    const int16Data = new Int16Array(rawBytes);
+                    
+                    // 2. ブラウザ用に Float32 (-1.0 ~ 1.0) に変換する
+                    // decodeAudioData を待つ必要がなく、計算だけで終わるため一瞬です
+                    const float32Data = new Float32Array(int16Data.length);
+                    for (let i = 0; i < int16Data.length; i++) {
+                        // 32768で割って正規化
+                        float32Data[i] = int16Data[i] / 32768.0;
+                    }
+
+                    // 3. 再生用バッファを作成 (モノラル, 長さ, 16000Hz)
+                    // ※new_text_to_speech.py の target_sr と合わせる必要があります(今は16000推奨)
+                    const audioBuffer = audioContext.createBuffer(1, float32Data.length, 16000);
+                    
+                    // 4. データをバッファにコピー
+                    audioBuffer.getChannelData(0).set(float32Data);
+
+                    // 5. 隙間なく再生するスケジュール管理
                     const source = audioContext.createBufferSource();
                     source.buffer = audioBuffer;
                     source.connect(audioContext.destination);
-                    currentSourceNode = source;
-                    source.onended = () => { currentSourceNode = null; isPlaying = false; processAudioQueue(); };
-                    source.start(0);
-                } catch(e) { isPlaying = false; currentSourceNode = null; }
+
+                    // 現在時刻と、予定時刻を比べて、遅れていれば現在時刻に合わせる
+                    if (nextStartTime < audioContext.currentTime) {
+                        nextStartTime = audioContext.currentTime;
+                    }
+                    
+                    source.start(nextStartTime);
+                    
+                    // 次の音声の開始予定時間を更新（今の音声の長さ分だけ後ろにずらす）
+                    nextStartTime += audioBuffer.duration;
+
+                    // 再生が終わるのを待たずに、次のデータの準備にすぐ取り掛かる！
+                    // (これで遅延がさらに減ります)
+                    processAudioQueue();
+                    
+                } catch(e) { 
+                    console.error("Raw再生エラー:", e);
+                    isPlaying = false;
+                }
             }
 
             btnStart.onclick = startRecording;

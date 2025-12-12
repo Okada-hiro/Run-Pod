@@ -8,6 +8,8 @@ filename = "Ref_voice_e3_s936.safetensors"
 filename = "Ref_voice_e3_s1878.safetensors"
 filename ="こんにちは_Ref_voice_e3_s3.safetensors"
 filename = "Ref_voice_e300_s2100.safetensors"
+filename = "Ref_voice_e400_s2800.safetensors"
+
 
 
 # ファイルをローカルにダウンロード

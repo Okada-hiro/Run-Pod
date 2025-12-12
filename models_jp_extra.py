@@ -360,6 +360,8 @@ class MLP(nn.Module):
         return x
 
 
+# models_jp_extra.py の TextEncoder クラス全体をこれに置換
+
 class TextEncoder(nn.Module):
     def __init__(
         self,
@@ -391,8 +393,22 @@ class TextEncoder(nn.Module):
         nn.init.normal_(self.language_emb.weight, 0.0, hidden_channels**-0.5)
         self.bert_proj = nn.Conv1d(1024, hidden_channels, 1)
 
-        # Remove emo_vq since it's not working well.
         self.style_proj = nn.Linear(256, hidden_channels)
+
+        # 【改造点1】 結合(Concat)後の情報を整理するための1x1畳み込み層 (Fusion層)
+        self.fusion = nn.Conv1d(hidden_channels * 2, hidden_channels, 1)
+
+        # 【改造点2】 Identity Initialization (学習済み重みを流用するための魔法)
+        # 初期状態では「単純な足し算」と同じ挙動をするように重みを固定します。
+        with torch.no_grad():
+            self.fusion.weight.zero_()
+            self.fusion.bias.zero_()
+            h = hidden_channels
+            identity = torch.eye(h)
+            # 前半（Acoustic側）を通す
+            self.fusion.weight[:, :h, 0] = identity
+            # 後半（BERT側）を通す
+            self.fusion.weight[:, h:, 0] = identity
 
         self.encoder = attentions.Encoder(
             hidden_channels,
@@ -415,35 +431,36 @@ class TextEncoder(nn.Module):
         style_vec: torch.Tensor,
         g: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        bert_emb = self.bert_proj(bert).transpose(1, 2)
-        # =========================================================
-        # ★★★ 介入ロジック (JP-Extra専用版) ★★★
-        # =========================================================
         
-        # 学習時の BERT Dropout (モデルにToneを学習させるため必須)
+        bert_emb = self.bert_proj(bert).transpose(1, 2)
+        
+        # 【改造点3】 学習時のBERT Dropout率を強化
+        # 80%の確率でBERTを遮断し、強制的にpyopenjtalk由来の情報を使わせます
         if self.training:
-            bert_mask = torch.bernoulli(torch.full((x.size(0), 1, 1), 0.5)).to(x.device)
+            dropout_rate = 0.8 
+            bert_mask = torch.bernoulli(torch.full((x.size(0), 1, 1), 1 - dropout_rate)).to(x.device)
             bert_emb = bert_emb * bert_mask
 
-        # 係数の設定
-        tone_boost = 1.7    # Tone(アクセント)を強める！#本来1.7
-        style_weight = 0.8    # Style(変な癖)を弱める
-        bert_dampen = 0.2     # BERT(文脈)を弱める #本来 0.2
+        # Styleの計算
+        style_emb = self.style_proj(style_vec.unsqueeze(1))
 
-        # Styleの計算と弱体化
-        style_emb = self.style_proj(style_vec.unsqueeze(1)) * style_weight
-
-        # 最終的な足し算 (ja_bertなどは存在しないので削除)
-        x = (
+        # 1. BERT以外の「音声学的に正しいはずの情報」をまとめる
+        #    Tone(アクセント)情報はここでしっかり入ります
+        x_acoustic = (
             self.emb(x)
-            + self.tone_emb(tone) * tone_boost       # Toneを強化
+            + self.tone_emb(tone)
             + self.language_emb(language)
-            + (bert_emb * bert_dampen)               # 唯一のBERTを弱める
             + style_emb
         ) * math.sqrt(self.hidden_channels)
-        
-        # ... (以下そのまま)
-        x = torch.transpose(x, 1, -1)  # [b, h, t]
+
+        x_acoustic = torch.transpose(x_acoustic, 1, -1) # [b, h, t]
+        bert_emb = torch.transpose(bert_emb, 1, -1)     # [b, h, t]
+
+        # 【改造点4】 足し算ではなく結合(Concat)してFusion層へ
+        x_combined = torch.cat([x_acoustic, bert_emb], dim=1)
+        x = self.fusion(x_combined)
+
+        # マスク処理などは既存通り
         x_mask = torch.unsqueeze(commons.sequence_mask(x_lengths, x.size(2)), 1).to(
             x.dtype
         )

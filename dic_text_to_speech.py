@@ -7,7 +7,7 @@ REPO_PATH = os.path.join(WORKSPACE_DIR, "Style_Bert_VITS2")
 ASSETS_DIR = os.path.join(REPO_PATH, "model_assets")
 
 # モデルファイル名
-MODEL_FILE = "Ref_voice_e400_s2800.safetensors"
+MODEL_FILE = "female_Ref_voice_e10_s50.safetensors"
 CONFIG_FILE = "config.json"
 STYLE_FILE = "style_vectors.npy"
 

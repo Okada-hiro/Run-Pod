@@ -23,11 +23,11 @@
     "c_commit": 100,
     "skip_optimizer": false,
     "freeze_ZH_bert": false,
-    "freeze_JP_bert": false,
+    "freeze_JP_bert": true,
     "freeze_EN_bert": false,
     "freeze_emo": false,
     "freeze_style": false,
-    "freeze_decoder": false
+    "freeze_decoder": true
   },
   "data": {
     "use_jp_extra": true,
@@ -112,7 +112,10 @@
       "hidden": 768,
       "nlayers": 13,
       "initial_channel": 64
-    }
+    },
+    "use_mecab_fusion": true,
+    "mecab_vocab_size": 25,
+    "mecab_embed_dim": 64
   },
   "version": "2.7.0-JP-Extra"
 }

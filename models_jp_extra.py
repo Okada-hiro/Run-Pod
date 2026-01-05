@@ -11,7 +11,7 @@ from style_bert_vits2.models import attentions, commons, modules, monotonic_alig
 from style_bert_vits2.nlp.symbols import NUM_LANGUAGES, NUM_TONES, SYMBOLS
 
 
-class DurationDiscriminator(nn.Module):  # vits2
+class DurationDiscriminator(nn.Module):
     def __init__(
         self,
         in_channels: int,
@@ -112,16 +112,6 @@ class TransformerCouplingBlock(nn.Module):
         self.flows = nn.ModuleList()
 
         self.wn = (
-            # attentions.FFT(
-            #     hidden_channels,
-            #     filter_channels,
-            #     n_heads,
-            #     n_layers,
-            #     kernel_size,
-            #     p_dropout,
-            #     isflow=True,
-            #     gin_channels=self.gin_channels,
-            # )
             None
             if share_parameter
             else None
@@ -171,7 +161,7 @@ class StochasticDurationPredictor(nn.Module):
         gin_channels: int = 0,
     ) -> None:
         super().__init__()
-        filter_channels = in_channels  # it needs to be removed from future version.
+        filter_channels = in_channels
         self.in_channels = in_channels
         self.filter_channels = filter_channels
         self.kernel_size = kernel_size
@@ -267,7 +257,7 @@ class StochasticDurationPredictor(nn.Module):
             return nll + logq  # [b]
         else:
             flows = list(reversed(self.flows))
-            flows = flows[:-2] + [flows[-1]]  # remove a useless vflow
+            flows = flows[:-2] + [flows[-1]]
             z = (
                 torch.randn(x.size(0), 2, x.size(2)).to(device=x.device, dtype=x.dtype)
                 * noise_scale
@@ -328,7 +318,6 @@ class DurationPredictor(nn.Module):
         x = self.proj(x * x_mask)
         return x * x_mask
 
-
 class Bottleneck(nn.Sequential):
     def __init__(self, in_dim: int, hidden_dim: int) -> None:
         c_fc1 = nn.Linear(in_dim, hidden_dim, bias=False)
@@ -359,8 +348,60 @@ class MLP(nn.Module):
         x = self.c_proj(x)
         return x
 
+# --- ★Fusion Layer (Tone Attention) ---
 
-# models_jp_extra.py の TextEncoder クラス全体をこれに置換
+class BertMecabFusion(nn.Module):
+    def __init__(self, bert_dim=1024, tone_dim=64, out_dim=192, n_heads=2):
+        super().__init__()
+        
+        # Tone Embedding (0:L, 1:H)
+        self.tone_emb = nn.Embedding(NUM_TONES, tone_dim)
+        
+        # Projections
+        self.bert_proj = nn.Linear(bert_dim, out_dim)
+        self.tone_proj = nn.Linear(tone_dim, out_dim)
+        
+        # Cross Attention
+        self.cross_attn = nn.MultiheadAttention(embed_dim=out_dim, num_heads=n_heads, batch_first=True)
+        
+        self.norm = nn.LayerNorm(out_dim)
+        self.dropout = nn.Dropout(0.1)
+
+        # --- ★修正1: ゼロ初期化 (Zero Initialization) ---
+        # これを入れることで、学習開始直後はこの層の出力が「ほぼ0」になり、
+        # 元のBERTの自然なイントネーションを壊さずにスタートできます。
+        nn.init.zeros_(self.cross_attn.out_proj.weight)
+        nn.init.zeros_(self.cross_attn.out_proj.bias)
+        
+        # --- ★修正2: 学習可能なゲート係数 (Gating) ---
+        # 最初は0からスタートし、学習が進むと自動的に適切なブレンド率を見つけます
+        self.gate = nn.Parameter(torch.tensor([0.0]))
+
+    def forward(self, bert, tone):
+        """
+        bert: (B, 1024, T) -> Conv1d input format
+        tone: (B, T) -> Integer sequence [0, 1, 1, 0...]
+        """
+        # BERT: (B, 1024, T) -> (B, T, 1024)
+        bert = bert.transpose(1, 2)
+        
+        # Tone Embedding: (B, T) -> (B, T, tone_dim)
+        tone_vec = self.tone_emb(tone)
+        
+        # Projections -> (B, T, out_dim)
+        q = self.bert_proj(bert)       # Query
+        k_v = self.tone_proj(tone_vec) # Key & Value
+        
+        # Attention (BERTがToneを参照)
+        attn_out, _ = self.cross_attn(query=q, key=k_v, value=k_v)
+        
+        # Residual & Norm
+        x = q + self.dropout(attn_out)
+        x = self.norm(x)
+        
+        return x
+
+# --- Text Encoder ---
 
 class TextEncoder(nn.Module):
     def __init__(
@@ -374,6 +415,8 @@ class TextEncoder(nn.Module):
         kernel_size: int,
         p_dropout: float,
         gin_channels: int = 0,
+        use_mecab_fusion: bool = False,
+        **kwargs
     ) -> None:
         super().__init__()
         self.n_vocab = n_vocab
@@ -385,30 +428,28 @@ class TextEncoder(nn.Module):
         self.kernel_size = kernel_size
         self.p_dropout = p_dropout
         self.gin_channels = gin_channels
+        
+        self.use_mecab_fusion = use_mecab_fusion
+
         self.emb = nn.Embedding(len(SYMBOLS), hidden_channels)
         nn.init.normal_(self.emb.weight, 0.0, hidden_channels**-0.5)
         self.tone_emb = nn.Embedding(NUM_TONES, hidden_channels)
         nn.init.normal_(self.tone_emb.weight, 0.0, hidden_channels**-0.5)
         self.language_emb = nn.Embedding(NUM_LANGUAGES, hidden_channels)
         nn.init.normal_(self.language_emb.weight, 0.0, hidden_channels**-0.5)
-        self.bert_proj = nn.Conv1d(1024, hidden_channels, 1)
+        
+        if self.use_mecab_fusion:
+            print("[INFO] TextEncoder: Bert-Tone Fusion Enabled.")
+            self.bert_fusion = BertMecabFusion(
+                bert_dim=1024,
+                tone_dim=64,
+                out_dim=hidden_channels,
+                n_heads=2
+            )
+        else:
+            self.bert_proj = nn.Conv1d(1024, hidden_channels, 1)
 
         self.style_proj = nn.Linear(256, hidden_channels)
-
-        # 【改造点1】 結合(Concat)後の情報を整理するための1x1畳み込み層 (Fusion層)
-        self.fusion = nn.Conv1d(hidden_channels * 2, hidden_channels, 1)
-
-        # 【改造点2】 Identity Initialization (学習済み重みを流用するための魔法)
-        # 初期状態では「単純な足し算」と同じ挙動をするように重みを固定します。
-        with torch.no_grad():
-            self.fusion.weight.zero_()
-            self.fusion.bias.zero_()
-            h = hidden_channels
-            identity = torch.eye(h)
-            # 前半（Acoustic側）を通す
-            self.fusion.weight[:, :h, 0] = identity
-            # 後半（BERT側）を通す
-            self.fusion.weight[:, h:, 0] = identity
 
         self.encoder = attentions.Encoder(
             hidden_channels,
@@ -430,37 +471,29 @@ class TextEncoder(nn.Module):
         bert: torch.Tensor,
         style_vec: torch.Tensor,
         g: Optional[torch.Tensor] = None,
+        mecab_ids: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         
-        bert_emb = self.bert_proj(bert).transpose(1, 2)
-        
-        # 【改造点3】 学習時のBERT Dropout率を強化
-        # 80%の確率でBERTを遮断し、強制的にpyopenjtalk由来の情報を使わせます
-        if self.training:
-            dropout_rate = 0.8 
-            bert_mask = torch.bernoulli(torch.full((x.size(0), 1, 1), 1 - dropout_rate)).to(x.device)
-            bert_emb = bert_emb * bert_mask
+        if self.use_mecab_fusion:
+            # bert: [B, 1024, T], tone: [B, T]
+            bert_emb = self.bert_fusion(bert, tone) 
+            bert_emb = bert_emb.transpose(1, 2) # [B, T, h] -> [B, h, T]
+        else:
+            bert_emb = self.bert_proj(bert).transpose(1, 2)
 
-        # Styleの計算
         style_emb = self.style_proj(style_vec.unsqueeze(1))
-
-        # 1. BERT以外の「音声学的に正しいはずの情報」をまとめる
-        #    Tone(アクセント)情報はここでしっかり入ります
-        x_acoustic = (
+        
+        x = (
             self.emb(x)
             + self.tone_emb(tone)
             + self.language_emb(language)
+            + bert_emb 
             + style_emb
-        ) * math.sqrt(self.hidden_channels)
-
-        x_acoustic = torch.transpose(x_acoustic, 1, -1) # [b, h, t]
-        bert_emb = torch.transpose(bert_emb, 1, -1)     # [b, h, t]
-
-        # 【改造点4】 足し算ではなく結合(Concat)してFusion層へ
-        x_combined = torch.cat([x_acoustic, bert_emb], dim=1)
-        x = self.fusion(x_combined)
-
-        # マスク処理などは既存通り
+        ) * math.sqrt(
+            self.hidden_channels
+        )
+        
+        x = torch.transpose(x, 1, -1)
         x_mask = torch.unsqueeze(commons.sequence_mask(x_lengths, x.size(2)), 1).to(
             x.dtype
         )
@@ -621,7 +654,7 @@ class Generator(torch.nn.Module):
             self.cond = nn.Conv1d(gin_channels, upsample_initial_channel, 1)
 
     def forward(
-        self, x: torch.Tensor, g: Optional[torch.Tensor] = None
+        self, x: torch.Tensor, g: Optional[torch.Tensor] = None, f0: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         x = self.conv_pre(x)
         if g is not None:
@@ -978,6 +1011,11 @@ class SynthesizerTrn(nn.Module):
         self.current_mas_noise_scale = self.mas_noise_scale_initial
         if self.use_spk_conditioned_encoder and gin_channels > 0:
             self.enc_gin_channels = gin_channels
+
+        use_mecab_fusion = kwargs.get("use_mecab_fusion", False)
+        mecab_vocab_size = kwargs.get("mecab_vocab_size", 20)
+        mecab_embed_dim = kwargs.get("mecab_embed_dim", 64)
+
         self.enc_p = TextEncoder(
             n_vocab,
             inter_channels,
@@ -988,6 +1026,9 @@ class SynthesizerTrn(nn.Module):
             kernel_size,
             p_dropout,
             gin_channels=self.enc_gin_channels,
+            use_mecab_fusion=use_mecab_fusion,
+            mecab_vocab_size=mecab_vocab_size,
+            mecab_embed_dim=mecab_embed_dim
         )
         self.dec = Generator(
             inter_channels,
@@ -1053,6 +1094,7 @@ class SynthesizerTrn(nn.Module):
         language: torch.Tensor,
         bert: torch.Tensor,
         style_vec: torch.Tensor,
+        mecab_ids: Optional[torch.Tensor] = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -1068,9 +1110,12 @@ class SynthesizerTrn(nn.Module):
             g = self.emb_g(sid).unsqueeze(-1)  # [b, h, 1]
         else:
             g = self.ref_enc(y.transpose(1, 2)).unsqueeze(-1)
+        
+        # ToneをTextEncoderに渡す (TextEncoder内部でFusionに使われる)
         x, m_p, logs_p, x_mask = self.enc_p(
             x, x_lengths, tone, language, bert, style_vec, g=g
         )
+        
         z, m_q, logs_q, y_mask = self.enc_q(y, y_lengths, g=g)
         z_p = self.flow(z, y_mask, g=g)
 
@@ -1112,11 +1157,9 @@ class SynthesizerTrn(nn.Module):
 
         logw_ = torch.log(w + 1e-6) * x_mask
         logw = self.dp(x, x_mask, g=g)
-        # logw_sdp = self.sdp(x, x_mask, g=g, reverse=True, noise_scale=1.0)
         l_length_dp = torch.sum((logw - logw_) ** 2, [1, 2]) / torch.sum(
             x_mask
         )  # for averaging
-        # l_length_sdp += torch.sum((logw_sdp - logw_) ** 2, [1, 2]) / torch.sum(x_mask)
 
         l_length = l_length_dp + l_length_sdp
 
@@ -1155,17 +1198,20 @@ class SynthesizerTrn(nn.Module):
         max_len: Optional[int] = None,
         sdp_ratio: float = 0.0,
         y: Optional[torch.Tensor] = None,
+        external_f0=None,
+        external_f0_callback=None,
+        mecab_ids: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple[torch.Tensor, ...]]:
-        # x, m_p, logs_p, x_mask = self.enc_p(x, x_lengths, tone, language, bert)
-        # g = self.gst(y)
         if self.n_speakers > 0:
             g = self.emb_g(sid).unsqueeze(-1)  # [b, h, 1]
         else:
             assert y is not None
             g = self.ref_enc(y.transpose(1, 2)).unsqueeze(-1)
+            
         x, m_p, logs_p, x_mask = self.enc_p(
             x, x_lengths, tone, language, bert, style_vec, g=g
         )
+        
         logw = self.sdp(x, x_mask, g=g, reverse=True, noise_scale=noise_scale_w) * (
             sdp_ratio
         ) + self.dp(x, x_mask, g=g) * (1 - sdp_ratio)
@@ -1187,5 +1233,18 @@ class SynthesizerTrn(nn.Module):
 
         z_p = m_p + torch.randn_like(m_p) * torch.exp(logs_p) * noise_scale
         z = self.flow(z_p, y_mask, g=g, reverse=True)
-        o = self.dec((z * y_mask)[:, :, :max_len], g=g)
+
+        f0_input = None
+        if external_f0_callback is not None:
+            f0_input = external_f0_callback(w_ceil[0]).to(x.device)
+        elif external_f0 is not None:
+            f0_input = external_f0
+
+        if f0_input is not None:
+            target_len = z.size(2)
+            if f0_input.size(2) != target_len:
+                f0_input = F.interpolate(f0_input, size=target_len, mode='linear')
+
+        o = self.dec((z * y_mask)[:, :, :max_len], f0=f0_input, g=g)
+        
         return o, attn, y_mask, (z, z_p, m_p, logs_p)

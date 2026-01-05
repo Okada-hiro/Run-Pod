@@ -112,16 +112,6 @@ class TransformerCouplingBlock(nn.Module):
         self.flows = nn.ModuleList()
 
         self.wn = (
-            # attentions.FFT(
-            #     hidden_channels,
-            #     filter_channels,
-            #     n_heads,
-            #     n_layers,
-            #     kernel_size,
-            #     p_dropout,
-            #     isflow=True,
-            #     gin_channels=self.gin_channels,
-            # )
             None
             if share_parameter
             else None
@@ -359,6 +349,25 @@ class MLP(nn.Module):
         x = self.c_proj(x)
         return x
 
+class BertMecabFusion(nn.Module):
+    def __init__(self, bert_dim=768, mecab_vocab=20, mecab_dim=64, out_dim=192, n_heads=2):
+        super().__init__()
+        self.mecab_emb = nn.Embedding(mecab_vocab, mecab_dim, padding_idx=0)
+        self.bert_proj = nn.Linear(bert_dim, out_dim)
+        self.mecab_proj = nn.Linear(mecab_dim, out_dim)
+        self.cross_attn = nn.MultiheadAttention(embed_dim=out_dim, num_heads=n_heads, batch_first=True)
+        self.norm = nn.LayerNorm(out_dim)
+        self.dropout = nn.Dropout(0.1)
+
+    def forward(self, bert, mecab_ids):
+        bert = bert.transpose(1, 2)
+        q = self.bert_proj(bert)
+        k_v = self.mecab_emb(mecab_ids)
+        k_v = self.mecab_proj(k_v)
+        attn_out, _ = self.cross_attn(query=q, key=k_v, value=k_v)
+        x = q + self.dropout(attn_out)
+        x = self.norm(x)
+        return x
 
 class TextEncoder(nn.Module):
     def __init__(
@@ -372,6 +381,9 @@ class TextEncoder(nn.Module):
         kernel_size: int,
         p_dropout: float,
         gin_channels: int = 0,
+        use_mecab_fusion: bool = False,
+        mecab_vocab_size: int = 20,
+        mecab_embed_dim: int = 64
     ) -> None:
         super().__init__()
         self.n_vocab = n_vocab
@@ -383,15 +395,27 @@ class TextEncoder(nn.Module):
         self.kernel_size = kernel_size
         self.p_dropout = p_dropout
         self.gin_channels = gin_channels
+        
+        self.use_mecab_fusion = use_mecab_fusion
+
         self.emb = nn.Embedding(len(SYMBOLS), hidden_channels)
         nn.init.normal_(self.emb.weight, 0.0, hidden_channels**-0.5)
         self.tone_emb = nn.Embedding(NUM_TONES, hidden_channels)
         nn.init.normal_(self.tone_emb.weight, 0.0, hidden_channels**-0.5)
         self.language_emb = nn.Embedding(NUM_LANGUAGES, hidden_channels)
         nn.init.normal_(self.language_emb.weight, 0.0, hidden_channels**-0.5)
-        self.bert_proj = nn.Conv1d(1024, hidden_channels, 1)
 
-        # Remove emo_vq since it's not working well.
+        if self.use_mecab_fusion:
+            self.bert_fusion = BertMecabFusion(
+                bert_dim=1024,
+                mecab_vocab=mecab_vocab_size,
+                mecab_dim=mecab_embed_dim,
+                out_dim=hidden_channels,
+                n_heads=2
+            )
+        else:
+            self.bert_proj = nn.Conv1d(1024, hidden_channels, 1)
+
         self.style_proj = nn.Linear(256, hidden_channels)
 
         self.encoder = attentions.Encoder(
@@ -414,9 +438,21 @@ class TextEncoder(nn.Module):
         bert: torch.Tensor,
         style_vec: torch.Tensor,
         g: Optional[torch.Tensor] = None,
+        mecab_ids: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        bert_emb = self.bert_proj(bert).transpose(1, 2)
+        
+        if self.use_mecab_fusion and mecab_ids is not None:
+            bert_emb = self.bert_fusion(bert, mecab_ids)
+        else:
+            if self.use_mecab_fusion:
+                 # Fallback
+                 b_trans = bert.transpose(1, 2)
+                 bert_emb = self.bert_fusion.bert_proj(b_trans)
+            else:
+                 bert_emb = self.bert_proj(bert).transpose(1, 2)
+
         style_emb = self.style_proj(style_vec.unsqueeze(1))
+        
         x = (
             self.emb(x)
             + self.tone_emb(tone)
@@ -425,8 +461,9 @@ class TextEncoder(nn.Module):
             + style_emb
         ) * math.sqrt(
             self.hidden_channels
-        )  # [b, t, h]
-        x = torch.transpose(x, 1, -1)  # [b, h, t]
+        )
+        
+        x = torch.transpose(x, 1, -1)
         x_mask = torch.unsqueeze(commons.sequence_mask(x_lengths, x.size(2)), 1).to(
             x.dtype
         )
@@ -554,9 +591,6 @@ class Generator(torch.nn.Module):
         self.conv_pre = Conv1d(
             initial_channel, upsample_initial_channel, 7, 1, padding=3
         )
-        # 【追加】 F0 (ピッチ) を処理する層
-        # 1チャンネル(F0値)を受け取り、モデル内部のチャンネル数に合わせます
-        self.f0_prenet = Conv1d(1, upsample_initial_channel, 3, 1, padding=1)
         resblock = modules.ResBlock1 if resblock_str == "1" else modules.ResBlock2
 
         self.ups = nn.ModuleList()
@@ -589,25 +623,14 @@ class Generator(torch.nn.Module):
         if gin_channels != 0:
             self.cond = nn.Conv1d(gin_channels, upsample_initial_channel, 1)
 
+    # ★修正箇所: f0を受け取るように変更
     def forward(
-        self, x: torch.Tensor, f0: Optional[torch.Tensor] = None, g: Optional[torch.Tensor] = None
+        self, x: torch.Tensor, g: Optional[torch.Tensor] = None, f0: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        
         x = self.conv_pre(x)
-        
-        # 【★追加】 F0 注入処理
-        if f0 is not None:
-            # 1. 時間軸の長さを合わせる (xの長さにリサイズ)
-            f0 = F.interpolate(f0, size=x.size(2), mode='linear')
-            # 2. 畳み込み層を通してチャンネル数を合わせる
-            x_f0 = self.f0_prenet(f0)
-            # 3. 足し算で注入
-            x = x + x_f0
-
         if g is not None:
             x = x + self.cond(g)
 
-        # 以下は元のまま
         for i in range(self.num_upsamples):
             x = F.leaky_relu(x, modules.LRELU_SLOPE)
             x = self.ups[i](x)
@@ -959,6 +982,11 @@ class SynthesizerTrn(nn.Module):
         self.current_mas_noise_scale = self.mas_noise_scale_initial
         if self.use_spk_conditioned_encoder and gin_channels > 0:
             self.enc_gin_channels = gin_channels
+
+        use_mecab_fusion = kwargs.get("use_mecab_fusion", False)
+        mecab_vocab_size = kwargs.get("mecab_vocab_size", 20)
+        mecab_embed_dim = kwargs.get("mecab_embed_dim", 64)
+
         self.enc_p = TextEncoder(
             n_vocab,
             inter_channels,
@@ -969,6 +997,9 @@ class SynthesizerTrn(nn.Module):
             kernel_size,
             p_dropout,
             gin_channels=self.enc_gin_channels,
+            use_mecab_fusion=use_mecab_fusion,
+            mecab_vocab_size=mecab_vocab_size,
+            mecab_embed_dim=mecab_embed_dim
         )
         self.dec = Generator(
             inter_channels,
@@ -1034,6 +1065,7 @@ class SynthesizerTrn(nn.Module):
         language: torch.Tensor,
         bert: torch.Tensor,
         style_vec: torch.Tensor,
+        mecab_ids: Optional[torch.Tensor] = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -1049,9 +1081,11 @@ class SynthesizerTrn(nn.Module):
             g = self.emb_g(sid).unsqueeze(-1)  # [b, h, 1]
         else:
             g = self.ref_enc(y.transpose(1, 2)).unsqueeze(-1)
+        
         x, m_p, logs_p, x_mask = self.enc_p(
-            x, x_lengths, tone, language, bert, style_vec, g=g
+            x, x_lengths, tone, language, bert, style_vec, g=g, mecab_ids=mecab_ids
         )
+        
         z, m_q, logs_q, y_mask = self.enc_q(y, y_lengths, g=g)
         z_p = self.flow(z, y_mask, g=g)
 
@@ -1093,11 +1127,9 @@ class SynthesizerTrn(nn.Module):
 
         logw_ = torch.log(w + 1e-6) * x_mask
         logw = self.dp(x, x_mask, g=g)
-        # logw_sdp = self.sdp(x, x_mask, g=g, reverse=True, noise_scale=1.0)
         l_length_dp = torch.sum((logw - logw_) ** 2, [1, 2]) / torch.sum(
             x_mask
         )  # for averaging
-        # l_length_sdp += torch.sum((logw_sdp - logw_) ** 2, [1, 2]) / torch.sum(x_mask)
 
         l_length = l_length_dp + l_length_sdp
 
@@ -1136,43 +1168,18 @@ class SynthesizerTrn(nn.Module):
         max_len: Optional[int] = None,
         sdp_ratio: float = 0.0,
         y: Optional[torch.Tensor] = None,
-        # ★引数追加
-        external_f0_callback: Optional[Any] = None, 
+        external_f0=None,
+        external_f0_callback=None,
+        mecab_ids: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple[torch.Tensor, ...]]:
-        
-        # モデルによっては ja_bert, en_bert 引数を要求するJP-Extra版と
-        # 通常版で引数が異なる場合がありますが、まずは以下のように共通化します。
-        # ※ あなたの環境は JP-Extra モデルのようなので、bert引数が ja_bert として扱われる可能性がありますが
-        #    Plan Cの tts_wrapper.py は bert=bert_tensor を渡しています。
-        #    もし引数エラーが出たら、ja_bert=bert, en_bert=bert のように渡す必要があります。
-
-        # JP-Extraの構造に合わせて引数を調整する場合:
-        # def infer(self, x, x_lengths, sid, tone, language, bert, ja_bert, en_bert, style_vec, ...)
-        
-        # 以下はあなたの `models_jp_extra_backup.py` の infer メソッドに基づいた修正版です
-        
-        # x, m_p, logs_p, x_mask = self.enc_p(x, x_lengths, tone, language, bert)
-        # g = self.gst(y)
         if self.n_speakers > 0:
             g = self.emb_g(sid).unsqueeze(-1)  # [b, h, 1]
         else:
             assert y is not None
             g = self.ref_enc(y.transpose(1, 2)).unsqueeze(-1)
             
-        # JP-Extraの場合、enc_p の引数が ja_bert, en_bert を要求するか確認してください
-        # 以前のコードを見る限り、JP-Extra版は ja_bert などを引数に取っていました。
-        # ここでは汎用的に書きますが、エラーが出たら引数を増やしてください。
-        
-        # ★重要: あなたの models.py の enc_p.forward がどうなっているかに依存します
-        # models_jp_extra_backup.py の TextEncoder.forward は bert, ja_bert, en_bert を受け取るようになっています
-        
-        # ここでは簡易的に、渡された bert を ja_bert, en_bert にも流用するダミー処理を入れます
-        # (Plan CではBERTを使わないので問題ありません)
-        ja_bert = bert
-        en_bert = bert
-
         x, m_p, logs_p, x_mask = self.enc_p(
-            x, x_lengths, tone, language, bert, ja_bert, en_bert, style_vec, sid, g=g
+            x, x_lengths, tone, language, bert, style_vec, g=g, mecab_ids=mecab_ids
         )
         
         logw = self.sdp(x, x_mask, g=g, reverse=True, noise_scale=noise_scale_w) * (
@@ -1196,25 +1203,18 @@ class SynthesizerTrn(nn.Module):
 
         z_p = m_p + torch.randn_like(m_p) * torch.exp(logs_p) * noise_scale
         z = self.flow(z_p, y_mask, g=g, reverse=True)
-        
-        # ★★★ Plan C: F0注入ロジック ★★★
+
         f0_input = None
-        
-        # 1. F0カーブの生成・取得
         if external_f0_callback is not None:
-            # モデルが予測したDuration (w_ceil) を渡して、F0を作ってもらう
-            # w_ceil[0] : [T_phoneme] (バッチサイズ1を想定)
             f0_input = external_f0_callback(w_ceil[0]).to(x.device)
-        
-        # 2. サイズ合わせ (Interpolate)
+        elif external_f0 is not None:
+            f0_input = external_f0
+
         if f0_input is not None:
             target_len = z.size(2)
             if f0_input.size(2) != target_len:
-                # F.interpolate は torch.nn.functional as F として import されている必要があります
-                f0_input = torch.nn.functional.interpolate(f0_input, size=target_len, mode='linear')
+                f0_input = F.interpolate(f0_input, size=target_len, mode='linear')
 
-        # 3. Generatorへ渡す (引数 f0 を指定)
-        # Generator.forward に f0 引数を追加済みであることが前提です
         o = self.dec((z * y_mask)[:, :, :max_len], f0=f0_input, g=g)
         
         return o, attn, y_mask, (z, z_p, m_p, logs_p)

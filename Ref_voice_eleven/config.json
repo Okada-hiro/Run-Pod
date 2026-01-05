@@ -4,7 +4,7 @@
     "log_interval": 200,
     "eval_interval": 1000,
     "seed": 42,
-    "epochs": 300,
+    "epochs": 200,
     "learning_rate": 0.0001,
     "betas": [
       0.8,
@@ -27,7 +27,7 @@
     "freeze_EN_bert": false,
     "freeze_emo": false,
     "freeze_style": false,
-    "freeze_decoder": false
+    "freeze_decoder": true
   },
   "data": {
     "use_jp_extra": true,
@@ -112,7 +112,8 @@
       "hidden": 768,
       "nlayers": 13,
       "initial_channel": 64
-    }
+    },
+    "use_mecab_fusion": true
   },
   "version": "2.7.0-JP-Extra"
 }

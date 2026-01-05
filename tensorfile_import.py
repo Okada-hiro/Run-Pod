@@ -4,7 +4,7 @@ from huggingface_hub import hf_hub_download
 repo_id = "okadahiroaki/new_model"
 
 # 取得したいファイル名（例: config.json）
-filename = "Ref_voice_e56_s500.safetensors"
+filename = "deomo/Ref_voice_e56_s500.safetensors"
 
 
 

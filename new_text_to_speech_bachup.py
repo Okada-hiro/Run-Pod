@@ -184,11 +184,13 @@ def synthesize_speech_to_memory(text_to_speak: str) -> bytes:
             language=Languages.JP,
             speaker_id=GLOBAL_SPEAKER_ID,
             style="Neutral",
+            pitch=1.2,
+            intonation=1.1,
             style_weight=0.7,
             sdp_ratio=0.2,
             noise=0.6,
             noise_w=0.8,
-            length=1.0
+            length=0.8
         )
         
         # 2. 16bit PCMに変換 (正規化)

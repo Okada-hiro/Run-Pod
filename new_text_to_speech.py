@@ -42,7 +42,7 @@ ACCENT_JSON_FILE = "accents.json"
 # --- ★モデルカタログ (ここで話者を定義します) ---
 MODEL_CATALOG = {
     "default": {
-        "model_file": "Ref_voice_e300_s2100.safetensors",
+        "model_file": "Ref_voice_e56_s500.safetensors",
         "config_file": "config.json",
         "style_file": "style_vectors.npy",
         "speaker_name": "Ref_voice", # モデル内の話者名(ID特定用)
@@ -61,11 +61,11 @@ MODEL_CATALOG = {
         "style_file": "style_vectors.npy",        # 違うなら変更
         "speaker_name": "No.2",                   # ★モデル内の正しい話者名
         "params": {
-            "pitch": 1.0, 
+            "pitch": 1.2, 
             "intonation": 1.0,
-            "length": 1.0,
+            "length": 0.8,
             "assist_text": "落ち着いた声で喋ります。",
-            "lpf_cutoff": 9000
+            "lpf_cutoff": 8000
         }
     }
 }
@@ -236,9 +236,9 @@ def synthesize_speech_to_memory(text_to_speak: str) -> bytes:
         
     try:
         # パラメータ取得
-        pitch = conf.get("pitch", 1.0)
-        intonation = conf.get("intonation", 1.0)
-        length = conf.get("length", 1.0)
+        pitch = conf.get("pitch", 1.2)
+        intonation = conf.get("intonation", 1.2)
+        length = conf.get("length", 0.8)
         assist_text = conf.get("assist_text", "")
         lpf_cutoff = conf.get("lpf_cutoff", 9000)
 
